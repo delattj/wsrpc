@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<title>Dispatch example</title>
+		<script src="/static/wsrpc.js" language="javascript"></script>
+	</head>
+	<script>
+
+var server = null;
+
+function init_page(address)
+{
+	server = new wsrpc.Node(address);
+}
+
+function log(node, data)
+{
+	var l = document.getElementById('log');
+	var html_c = '<div>Dispatched '+ data.Name +'</div>';
+	l.insertAdjacentHTML('beforeend', html_c);
+}
+
+	</script>
+
+<body onload="init_page('ws://{{ .Server }}/web')">
+	<div>
+		<button onclick="server.remote_call('Web.Dispatch', {Name:'Some work'}, log);">Dispatch Work</button>
+		<button onclick="server.close();">Close</button>
+	</div>
+	<div id="log"></div>
+</body>
+
+</html>
