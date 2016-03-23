@@ -13,6 +13,7 @@ The library was first created based on Go net/rpc code. wsrpc does share the sam
 
 See **sample_dispatch** project for an implementation example.
 The example include a Javascript version of the protocol. However it supports only sending requests and receiving responses.
+Compile **server** and **node**. Start the *server* executable, then you can connect *nodes* (note that only one node per MAC address is supported). To dispatch message connect to the server via a web browser (ie: http://localhost:8080/).
 
 ## Getting started
 
@@ -48,7 +49,7 @@ The reply value will be avaible at this point.
 You can use PendingRequest.OnDone channel as an alternate way to synchronize.
 
 ### Server
-Use *wsrpc.Handler* to register the services on the Go standard http server:
+Use **wsrpc.Handler** to register the services on the Go standard http server:
 ```go
 http.Handle(path, wsrpc.Handler(s Service))
 ```
@@ -56,7 +57,7 @@ You then run the server as usual:
 ```go
 http.ListenAndServe(":"+ port, nil)
 ```
-Remote call are possible through the *wsrpc.Conn* object passed to the services and events.
+Remote call are possible through the **wsrpc.Conn** object passed to the services and events.
 
 ### Service
 **Service** is an interface that require this signatures:
@@ -66,8 +67,8 @@ type Service interface {
 	OnDisconnect(c *wsrpc.Conn)
 }
 ```
-*OnConnect* and *OnDisconnect* are events callback triggered at the propriate time.
-*wsrpc.Conn* represent the connection to the remote end. Through that instance you may send remote request or query connection (ie: conn.IsConnected()).
+**OnConnect** and **OnDisconnect** are events callback triggered at the propriate time.
+**wsrpc.Conn** represent the connection to the remote end. Through that instance you may send remote request or query connection (ie: *conn.IsConnected()*).
 To expose service methods they must satify these criteria:
  - the method's type is exported.
  - the method is exported.
@@ -117,12 +118,60 @@ pending.Wait() error
 The method is blocking.
 The return error is the remote error if any, otherwise return nil.
 The reply value will be avaible at this point.
-You can use PendingRequest.OnDone channel as an alternate way to synchronize.
+You can use **PendingRequest.OnDone** channel as an alternate way to synchronize.
 
 ## API Reference
 
+### constructor:
+```go
+wsrpc.Handler(s Service) websocket.Handler
+```
+Use to create handler compatible with **http.Handle()**. To create valid **Service** refer to above *Service* section.
+
+```go
+wsrpc.NewNode(url string, s Service) wsrpc.Node
+```
+**url** must be a valid address to a websocket server (ie: ws/localhost:8080/node).
+
 ### type Node
-**TODO**
+```go
+type Node struct {
+	conn *Conn
+	Url string
+	Origin string
+}
+```
+
+```go
+func (n *Node) WaitConnected()
+```
+Block until Node is connected to a server.
+
+```go
+func (n *Node) SetReconnect(elapse uint16)
+```
+Set time that elapse between 2 reconnections attempt. By default there is no reconnection attempt if connection fails or connection is lost. Setting a value superior to 0 will enable that feature. Setting it to 0 will disable the feature.
+The value is in second.
+
+```go
+func (n *Node) Serve()
+```
+Serve incoming messages either RPC request or RPC response. The method is blocking.
+
+```go
+func (n *Node) Close() error
+```
+Close connection. If reconnection is enable it will try to reconnect. You might want to disable reconnection before closing.
+
+```go
+func (n *Node) RemoteCall(name string, kwargs, reply interface{}) (pending *PendingRequest, err error)
+```
+Make a remote call request. The method will blocking until the Node is connected and message is sent.
+**reply** must be a pointer to an JSON encodable object initialized before sending the request.
+**name** is the name of the **Service** your are trying to use and its **method** name written in dotted syntax: **'MyService.MyFunc'**
+**kwargs** is an object that can be JSON encoded that will be send together with the remote request.
+**error** if non **nil** will represent the error happened during sending the request.
+**pending** is an object that let you know when the **reply** value will be recieved and ready to use. See below for more details.
 
 ### type Conn
 **TODO**
