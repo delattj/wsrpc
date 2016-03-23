@@ -111,18 +111,19 @@ You can send remote request through **wsrpc.Node** or **wsrpc.Conn**(while insid
 conn.RemoteCall(name string, kwargs, reply interface{}) (pending *PendingRequest, err error)
 ```
 The method will first wait for the node to connect to the serve; then it blocks for the time to send the data over. But the result will be fulfilled by **node.Serve()** or **wsrpc.Handler**. In the meantime use the return *PendingRequest* object to know when the result will be available.
+
 To do so, you can do:
 ```go
 pending.Wait() error
 ```
-The method is blocking.
-The return error is the remote error if any, otherwise return nil.
-The reply value will be avaible at this point.
+The method is blocking.  
+The return error is the remote error if any, otherwise return nil.  
+The reply value will be avaible at this point.  
 You can use **PendingRequest.OnDone** channel as an alternate way to synchronize.
 
 ## API Reference
 
-### constructor:
+### Constructors:
 ```go
 wsrpc.Handler(s Service) websocket.Handler
 ```
@@ -168,7 +169,7 @@ func (n *Node) RemoteCall(name string, kwargs, reply interface{}) (pending *Pend
 ```
 Make a remote call request. The method will blocking until the Node is connected and message is sent.
 **reply** must be a pointer to an JSON encodable object initialized before sending the request.
-**name** is the name of the **Service** your are trying to use and its **method** name written in dotted syntax: **'MyService.MyFunc'**
+**name** is the name of the **Service** your are trying to use and its **method** name written in dotted syntax: **'MyService.MyFunc'**.
 **kwargs** is an object that can be JSON encoded that will be send together with the remote request.
 **error** if non **nil** will represent the error happened during sending the request.
 **pending** is an object that let you know when the **reply** value will be recieved and ready to use. See below for more details.
