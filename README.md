@@ -137,7 +137,6 @@ wsrpc.NewNode(url string, s Service) wsrpc.Node
 ### type Node
 ```go
 type Node struct {
-	conn *Conn
 	Url string
 	Origin string
 }
@@ -175,7 +174,93 @@ Make a remote call request. The method will blocking until the Node is connected
 **pending** is an object that let you know when the **reply** value will be recieved and ready to use. See below for more details.
 
 ### type Conn
-**TODO**
+```go
+type Conn struct {
+	OnDisconnect chan bool // Event channel. Can be used with select statement.
+}
+```
+The **OnDisconnect** channel will be closed when connection is closed.  
+You can effectively use this code in as many goroutine as needed:
+```go
+select {
+case <-c.OnDisconnect:
+	// something happen here
+// any other concurrent channels can be added too.
+}
+```
+
+```go
+func (c *Conn) RemoteCall(name string, kwargs, reply interface{}) (pending *PendingRequest, err error)
+```
+Just like **Node.RemoteCall()**
+
+```go
+func (c *Conn) IsConnected() bool
+```
+Return true if still connected to remote end.
+
+```go
+func (c *Conn) Close() error
+```
+Close connection.
+
+```go
+func (c *Conn) Request() *http.Request
+```
+This is to aligned with **websocket.Conn** interface.  
+Return the **http.Request** object if connection is on the server side. On the client side it will return nil.
+
+```go
+func (c *Conn) SetDeadline(t time.Time) error
+```
+This is to aligned with **websocket.Conn** interface.  
+Sets the connection's network read & write deadlines.
+
+```go
+func (c *Conn) SetReadDeadline(t time.Time) error
+```
+This is to aligned with **websocket.Conn** interface.  
+Sets the connection's network read deadline.
+
+```go
+func (c *Conn) SetWriteDeadline(t time.Time) error
+```
+This is to aligned with **websocket.Conn** interface.  
+Sets the connection's network write deadline.
 
 ### type PendingRequest
-**TODO**
+```go
+type PendingRequest struct {
+	Reply interface{}
+	OnDone chan bool // Event channel. Can be used with select statement
+	Error error
+}
+```
+Returned by **RemoteCall()** to know when **Reply** is ready and if any error happened.  
+**Error** will be different than nil if an error occured.  
+To know the state of the pending request, use either **OnDone** channel, **Wait()** or **WaitTimeout()**.  
+The **OnDone** channel will be closed when **Reply** is ready.  
+You can effectively use this code in as many goroutine as needed:
+```go
+select {
+case <-p.OnDone:
+	// something happen here
+// any other concurrent channels can be added too.
+}
+```
+**Wait()** and **WaitTimeout()** in the other hand are blocking.
+
+```go
+func (p *PendingRequest) Wait() error
+```
+Will block until the *Reply* is ready. If an error occured during th execution it will be returned, otherwise nil.
+
+```go
+func (p *PendingRequest) WaitTimeout(t time.Duration) error
+```
+Like **Wait()** but will return **wsrpc.ErrTimeout** if timeout is reached before.
+
+```go
+func (p *PendingRequest) HasFailed() bool
+```
+Return true if Error is different than nil. The return value is valid only if the pending request was completed.
