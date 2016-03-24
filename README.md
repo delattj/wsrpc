@@ -180,7 +180,7 @@ type Conn struct {
 }
 ```
 The **OnDisconnect** channel will be closed when connection is closed.  
-You can effectively use this code in as many goroutine as needed:
+Because all receive operator of a channel will return when it close; you can effectively use this code in as many goroutine as needed:
 ```go
 select {
 case <-c.OnDisconnect:
@@ -240,7 +240,7 @@ Returned by **RemoteCall()** to know when **Reply** is ready and if any error ha
 **Error** will be different than nil if an error occured.  
 To know the state of the pending request, use either **OnDone** channel, **Wait()** or **WaitTimeout()**.  
 The **OnDone** channel will be closed when **Reply** is ready.  
-You can effectively use this code in as many goroutine as needed:
+Because all receive operator of a channel will return when it close; you can effectively use this code in as many goroutine as needed:
 ```go
 select {
 case <-p.OnDone:
