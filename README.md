@@ -133,15 +133,15 @@ Conveniently type **wsrpc.Nothing** may be used as type for *kwargs* and *reply*
 
 To encode message, all types are single objects, serialized using JSON.  
 Resquest and response share the same JSON layout:  
- - **ID** an ID used by the sender to relate to the resquest.  
+ - **ID**, an ID used by the sender to relate to the resquest.  
  It must be a **uint32**. **0** means no return value, even error will be ignored.  
- - **SV** a **string** used to differenciate resquest from response or error report.  
+ - **SV**, a **string** used to differenciate resquest from response or error report.  
  A response will have "**R**" as **SV** value, an error "**ERR**", while a resquest will be any other value.  
  We strongly suggest to use dotted syntax to structure your service names, but this is not enforced.  
- - **KW** can be any JSON types. For error report, a simple **string** is expected.  
+ - **KW**, it can be any JSON types. For error report, a simple **string** is expected.  
 
 By default a response is expected after a request. But you have the option to discard that worflow by setting a request **ID** to **0**.  
-When sending an error report, **KW** is expected to be a simple string. If no value need to be sent or returned **KW** must be set to **null**.
+If no value need to be sent or returned **KW** must be set to **null**. When sending an error report, **KW** is expected to be a simple string.  
 
 ### Examples:
 ```javascript
