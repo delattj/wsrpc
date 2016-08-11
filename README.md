@@ -135,7 +135,7 @@ To encode message, all types are single objects, serialized using JSON.
 Resquest and response share the same JSON layout:  
  - **ID** an ID used by the sender to relate to the resquest.  
  It must be a **uint32**. **0** means no return value, even error will be ignored.  
- - **SV** a **string* used to differenciate resquest from response or error report.  
+ - **SV** a **string** used to differenciate resquest from response or error report.  
  A response will have "**R**" as **SV** value, an error "**ERR**", while a resquest will be any other value.  
  We strongly suggest to use dotted syntax to structure your service names, but this is not enforced.  
  - **KW** can be any JSON types. For error report, a simple **string** is expected.  
