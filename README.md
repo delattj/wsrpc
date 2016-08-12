@@ -132,11 +132,11 @@ Conveniently type **wsrpc.Nothing** may be used as type for *kwargs* and *reply*
 ## Message encoding aka JSON Layer
 
 To encode message, all types are single objects, serialized using JSON.  
-Resquest and response share the same JSON layout:  
- - **ID**, an ID used by the sender to relate to the resquest.  
+Request and response share the same JSON layout:  
+ - **ID**, an ID used by the sender to relate to the request.  
  It must be a **uint32**. **0** means no return value, even error will be ignored.  
- - **SV**, a **string** used to differenciate resquest from response or error report.  
- A response will have "**R**" as **SV** value, an error "**ERR**", while a resquest will be any other value.  
+ - **SV**, a **string** used to differenciate request from response or error report.  
+ A response will have "**R**" as **SV** value, an error "**ERR**", while a request will be any other value.  
  We strongly suggest to use dotted syntax to structure your service names, but this is not enforced.  
  - **KW**, it can be any JSON types. For error report, a simple **string** is expected.  
 
@@ -145,13 +145,13 @@ If no value need to be sent or returned **KW** must be set to **null**. When sen
 
 ### Examples:
 ```javascript
-{"ID": 1001, "SV": "Hello", "KW": null} //Resquest
+{"ID": 1001, "SV": "Hello", "KW": null} //Request
 {"ID": 1001, "SV": "R", "KW": null} //Response
-{"ID": 1002, "SV": "Math.Sum", "KW": {"values": [1, 2]}} //Resquest
+{"ID": 1002, "SV": "Math.Sum", "KW": {"values": [1, 2]}} //Request
 {"ID": 1002, "SV": "R", "KW": 3} //Response
-{"ID": 1003, "SV": "Math.Divide", "KW": {"A": 1, "B": 0}} //Resquest
+{"ID": 1003, "SV": "Math.Divide", "KW": {"A": 1, "B": 0}} //Request
 {"ID": 1003, "SV": "ERR", "KW": "Division by 0"} //Response
-{"ID": 0, "SV": "Send.NoReply", "KW": null} //Resquest
+{"ID": 0, "SV": "Send.NoReply", "KW": null} //Request
 ```
 
 ## API Reference
