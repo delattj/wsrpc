@@ -4,6 +4,7 @@ import (
 	"os"
 	"net"
 	"log"
+	"time"
 	"syscall"
 	"os/signal"
 	"../../../wsrpc"
@@ -12,6 +13,7 @@ import (
 
 type Node struct {
 	Mac string
+	Filename string
 }
 
 func (n *Node) Dispatch(cnx *wsrpc.Conn, kwargs *data.Work, reply wsrpc.Nothing) (err error) {
@@ -34,9 +36,61 @@ func (n *Node) OnConnect(cnx *wsrpc.Conn) {
 		return
 	}
 	log.Println("[INFO] Node registered")
+
+	if n.Filename != "" {
+		go GetFile(cnx, n.Filename)
+	}
+
 }
 
 func (n *Node) OnDisconnect(cnx *wsrpc.Conn) {
+}
+
+func GetFile(cnx *wsrpc.Conn, filename string) {
+
+	log.Println("[INFO] Requesting file:", filename)
+	stream, err := cnx.RemoteStream("Node.GetFile", filename)
+	if err != nil {
+		log.Printf("[ERROR] %s\n", err)
+		return
+	}
+
+	file, err := os.Create(filename)
+	if err != nil {
+		log.Printf("[ERROR] %s\n", err)
+		stream.Cancel()
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(1*time.Second)
+		defer ticker.Stop()
+		
+		var l, p uint64
+		for l == 0 || l != p {
+			select {
+			case <-stream.OnDone():
+				return
+
+			case <-ticker.C:
+				p, l = stream.Progress()
+				if l > 0 {
+					pp := p*100 / l
+					log.Printf("[PROGRESS] %v%%\n", pp)
+				}
+			}
+		}
+	}()
+
+	err = stream.ReceiveFile(file)
+	if err != nil {
+		log.Printf("[ERROR] %s\n", err)
+		return
+	}
+
+	file.Close()
+
+	log.Printf("[INFO] File transfer done.\n")
 }
 
 func OnInterrupt(callback func()) {
@@ -54,9 +108,13 @@ func OnInterrupt(callback func()) {
 func main() {
 
 	// Command line arguments
-	server := "localhost:8080"
+	var filename string
 	if len(os.Args) > 1 {
-		server = os.Args[1]
+		filename = os.Args[1]
+	}
+	server := "localhost:8080"
+	if len(os.Args) > 2 {
+		server = os.Args[2]
 	}
 
 	// Get Mac Address
@@ -67,6 +125,7 @@ func main() {
 	// Initialize Service
 	n := new(Node)
 	n.Mac = mac
+	n.Filename = filename
 
 	ws := wsrpc.NewNode("ws://"+ server +"/node", n)
 	ws.SetReconnect(5) // If disconnected, try reconnecting every 5 seconds

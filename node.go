@@ -40,6 +40,11 @@ func (n *Node) WaitConnected() {
 	n.connected.Wait()
 }
 
+func (n *Node) GetConnection() *Conn {
+	n.connected.Wait()
+	return n.conn
+}
+
 // Enable reconnection every <elapse> seconds until successful
 func (n *Node) SetReconnect(elapse uint16) {
 	n.reconnect = elapse
@@ -72,11 +77,6 @@ func (n *Node) Close() error {
 		return c.Close()
 	}
 	return errors.New("Node is not connected.")
-}
-
-func (n *Node) RemoteCall(name string, kwargs, reply interface{}) (pending *PendingRequest, err error) {
-	n.WaitConnected()
-	return n.conn.RemoteCall(name, kwargs, reply)
 }
 
 func NewNode(url string, s Service) *Node {

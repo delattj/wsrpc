@@ -109,6 +109,28 @@ func (n *Node) RegisterMac(cnx *wsrpc.Conn, mac string, reply *int) (err error) 
 	return
 }
 
+func (n *Node) GetFile(cnx *wsrpc.Conn, filename string, stream wsrpc.StreamSender) (err error) {
+	log.Printf("[INFO] Requested file %s\n", filename)
+
+	file, err := os.Open(filename)
+	if err != nil { return }
+	info, err := file.Stat()
+	if err != nil { return }
+
+	err = stream.SendFile(file, uint64(info.Size()))
+	if err != nil {
+		log.Printf("[ERROR] %s\n", err)
+		return
+	}
+
+	file.Close()
+
+	log.Printf("[INFO] Done\n")
+	
+	return
+}
+
+
 func (n *Node) OnConnect(cnx *wsrpc.Conn) {
 	log.Println("[INFO] Node connected")
 }
