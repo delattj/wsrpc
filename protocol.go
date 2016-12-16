@@ -4,38 +4,18 @@ import (
 	"log"
 	"io"
 	// "fmt"
-	"time"
-	"net/http"
-	"golang.org/x/net/websocket"
-	"encoding/binary"
-	"encoding/json"
-	"crypto/rand"
-	"reflect"
 	"sync"
+	"time"
 	"errors"
-	"strings"
+	"reflect"
 	"unicode"
+	// "net/http"
+	"crypto/rand"
 	"unicode/utf8"
+	"encoding/hex"
+	"encoding/binary"
+	"golang.org/x/net/websocket"
 )
-
-type request struct { // When receiving
-	ID uint32          // ID:0 means no return value
-	SV string          // SV:"R" => Response, SV:"ERR" => Error report, the rest is a request
-	KW json.RawMessage // to decode later depending of SV
-}
-
-type response struct { // When sending
-	ID uint32
-	SV string
-	KW interface{}
-}
-
-type stream_packet []byte // Stream packet
-var MaxChunkSize uint64 = 64787
-
-type message interface { // Hold request or stream packet incoming message type
-	process(*Conn)
-}
 
 // Precompute the reflect type for error.  Can't use error directly
 // because Typeof takes an empty interface value.  This is annoying.
@@ -55,6 +35,7 @@ var (
 	ErrConnectionClosed			= errors.New("wsrpc: Closed connections.")
 	ErrUnexpectedStreamPacket	= errors.New("wsrpc: Did not expect a stream packet for this pending request.")
 	ErrNoMoreData				= errors.New("wsrpc: No more data to read from buffer io.")
+	ErrHandshake				= errors.New("wsrpc: Handshake failed.")
 )
 
 // Type use to as place of arguments and/or reply type in method signature when
@@ -71,42 +52,45 @@ type methodType struct {
 }
 
 type Service interface {
-	OnConnect(c *Conn)
-	OnDisconnect(c *Conn)
+	OnHandshake(*Header) error
+	OnConnect(*Conn)
+	OnDisconnect(*Conn)
 }
 
 type service struct {
-	rcvr    Service                // receiver of methods
-	v_rcvr  reflect.Value          // Value of the receiver
-	typ     reflect.Type           // type of the receiver
-	method  map[string]*methodType // registered methods
+	rcvr     Service                // receiver of methods
+	v_rcvr   reflect.Value          // Value of the receiver
+	typ      reflect.Type           // type of the receiver
+	method   map[string]*methodType // registered methods
+	mux      map[string]*Conn       // multiplexer connection
+	lock     sync.Mutex
+	max_conn uint8
 }
 
-func (c *Conn) serve() {
-	// handling Connect/Disconnect events
-	c.connected()
-	if c.srv.rcvr != nil {
-		go c.srv.rcvr.OnConnect(c)
-		defer c.srv.rcvr.OnDisconnect(c)
-	}
-	defer c.disconnected()
+func newService() (s *service) {
+	return &service{mux:make(map[string]*Conn), max_conn:1}
+}
 
-	for { // message dispatch loop
-		m, err := c.readMessage()
-		if err != nil {
-			if err == io.EOF {
-				log.Println("[WARNING] Connection closed.")
+func (srv *service) getMux(id string) *Conn {
+	srv.lock.Lock()
+	defer srv.lock.Unlock()
+	return srv.mux[id]
+}
 
-			} else {
-				log.Println("[ERROR] "+ err.Error())
-			}
-			break
-		}
+func (srv *service) putMux(id string, c *Conn) {
+	srv.lock.Lock()
+	srv.mux[id] = c
+	srv.lock.Unlock()
+}
 
-		if m != nil {
-			m.process(c)
-		}
-	}
+func (srv *service) removeMux(id string) {
+	srv.lock.Lock()
+	delete(srv.mux, id)
+	srv.lock.Unlock()
+}
+
+func (srv *service) maxSocket(max uint8) {
+	srv.max_conn = max
 }
 
 func (s *service) register(rcvr Service) error {
@@ -150,8 +134,8 @@ func suitableMethods(typ reflect.Type, sname string, reportErr bool) map[string]
 		method := typ.Method(m)
 		mtype := method.Type
 		mname := sname +"."+ method.Name
-		// Discard OnConnect/OnDisconnect events
-		if method.Name == "OnConnect" || method.Name == "OnDisconnect" {
+		// Discard OnHandshake/OnConnect/OnDisconnect events
+		if method.Name == "OnHandshake" || method.Name == "OnConnect" || method.Name == "OnDisconnect" {
 			continue
 		}
 		// Method must be exported.
@@ -230,7 +214,570 @@ func isExportedOrBuiltinType(t reflect.Type) bool {
 	return isExported(t.Name()) || t.PkgPath() == ""
 }
 
+// Request id generator
+func generateId() (id uint32) {
+	for id == 0 {
+		b := make([]byte, 4)
+		rand.Read(b)
+		id = binary.BigEndian.Uint32(b)
+	}
+	return 
+}
+func generateByteId(length int) []byte {
+	b := make([]byte, length)
+	rand.Read(b)
+	return  b
+}
+func generateHexId(length int) string {
+	return hex.EncodeToString(generateByteId(length))
+}
+
+type requestId struct {
+	n uint32
+	lock sync.Mutex
+}
+
+func (rid *requestId) get() uint32 {
+	rid.lock.Lock()
+
+	rid.n++
+	if rid.n == 0 {
+		rid.n = 1
+	}
+
+	rid.lock.Unlock()
+
+	return rid.n
+}
+
+type streamingMap struct {
+	lock sync.Mutex
+	book map[uint32]StreamSender
+}
+
+func (s *streamingMap) set(id uint32, item StreamSender) {
+	s.lock.Lock()
+	s.book[id] = item
+	s.lock.Unlock()
+}
+
+func (s *streamingMap) pop(id uint32) (item StreamSender) {
+	s.lock.Lock()
+	item = s.book[id]
+	if item != nil {
+		delete(s.book, id)
+	}
+	s.lock.Unlock()
+	return
+}
+
+func (s *streamingMap) dropAll(err error) {
+	s.lock.Lock()
+	for _, item := range s.book {
+		item.setError(err)
+	}
+	s.book = make(map[uint32]StreamSender)
+	s.lock.Unlock()
+}
+
+func newStreamingMap() *streamingMap {
+	return &streamingMap{book:make(map[uint32]StreamSender)}
+}
+
+type pendingMap struct {
+	lock sync.RWMutex
+	book map[uint32]PendingRequest
+}
+
+func (s *pendingMap) set(id uint32, item PendingRequest) {
+	s.lock.Lock()
+	s.book[id] = item
+	s.lock.Unlock()
+}
+
+func (s *pendingMap) pop(id uint32) (item PendingRequest) {
+	s.lock.Lock()
+	item = s.book[id]
+	if item != nil {
+		delete(s.book, id)
+	}
+	s.lock.Unlock()
+	return
+}
+
+func (s *pendingMap) peek(id uint32) (item PendingRequest) {
+	s.lock.RLock()
+	item = s.book[id]
+	s.lock.RUnlock()
+	return
+}
+
+func (s *pendingMap) dropAll(err error) {
+	s.lock.Lock()
+	for _, item := range s.book {
+		item.setError(err)
+	}
+	s.book = make(map[uint32]PendingRequest)
+	s.lock.Unlock()
+}
+
+func newPendingMap() *pendingMap {
+	return &pendingMap{book:make(map[uint32]PendingRequest)}
+}
+
+// Wrap around the websocket.Conn struct
+type wsConn struct {
+	*websocket.Conn
+	binary chan []byte
+	ondisconnect chan bool
+	header *Header
+	id string
+}
+
+func (c *wsConn) isConnected() bool {
+	select {
+	case <-c.ondisconnect:
+		return false
+	default:
+		return true
+	}
+}
+
+func (c *wsConn) handshake(srv *service) (err error) {
+	header := c.header
+	if c.IsServerConn() {
+		if err := header.readFrom(c.Conn); err != nil { return err }
+		if !header.Has("channel") { return ErrHandshake }
+		id := header.Get("channel").(string)
+		if id == "" {
+			// New connection, generate random id
+			id = generateHexId(4)
+		} else {
+			// Validate existing id
+			mux := srv.getMux(id)
+			if mux == nil {
+				err = errors.New("Invalid channel id")
+			}
+		}
+		header.Set("channel", id)
+		c.id = id
+
+	} else if !header.Has("channel") { // If Client Conn has no id,
+		header.Set("channel", "")      // request an id (send empty id)
+	}
+	// Custom handshake
+	if err == nil && srv.rcvr != nil {
+		err = srv.rcvr.OnHandshake(header)
+	}
+	if err != nil {
+		header.Set("error", err.Error())
+	}
+	// Send header
+	if header.writeTo(c.Conn) != nil { return ErrHandshake }
+	if err != nil { return err }
+	if c.IsClientConn() {
+		if err := header.readFrom(c.Conn); err != nil { return err }
+		if !header.Has("channel") { return ErrHandshake }
+		c.id = header.Get("channel").(string)
+	}
+
+	return
+}
+
+func (c *wsConn) validate(srv *service) error {
+	if err := c.handshake(srv); err != nil {
+		c.Close()
+		return err
+	}
+	return nil
+}
+
+func (c *wsConn) clean(mux *Conn) {
+	close(c.ondisconnect)
+	mux.pool.Prune(c)
+}
+
+func (c *wsConn) serve(mux *Conn) {
+	defer c.clean(mux)
+	go c.sender(mux)
+	for { // message dispatch loop
+		m, err := c.readMessage()
+		if err != nil {
+			if err == io.EOF {
+				log.Println("[WARNING] Connection closed.")
+			} else {
+				log.Println("[ERROR] "+ err.Error())
+			}
+			return
+		}
+		if m != nil {
+			m.process(mux)
+		}
+	}
+}
+
+func (c *wsConn) readMessage() (m message, err error) {
+	err = MESSAGE.Receive(c.Conn, &m)
+	return
+}
+
+func (c *wsConn) sender(mux *Conn) {
+	for {
+		select {
+		case data := <-c.binary:
+			_, err := c.Write(data)
+			if err != nil {
+				log.Println("[ERROR] "+ err.Error())
+				// Queue data to another wsConn?
+				return
+			}
+			mux.pool.Put(c)
+		case <-c.ondisconnect:
+			return // leaving
+		}
+	}
+}
+func (c *wsConn) sendByte(data []byte) {
+	c.binary <-data
+}
+
+func wrapConn(ws *websocket.Conn, h *Header) *wsConn {
+	ws.PayloadType = websocket.BinaryFrame // Default to binary frame for stream
+	if h == nil { h = newHeader() } else { h = h.Clone() }
+	c := wsConn{ws, make(chan []byte, 256), make(chan bool), h, ""}
+	return &c
+}
+
+type wsDial func() (*wsConn, error)
+
+type wsPool struct {
+	dial wsDial
+	list chan *wsConn
+	count uint8
+	max uint8
+	lock sync.Mutex
+	ondisconnect chan chan bool
+}
+
+func newPool(max uint8, dial wsDial) *wsPool {
+	return &wsPool{dial:dial, list:make(chan *wsConn, int(max)), max:max,
+					ondisconnect:make(chan chan bool, int(max))}
+}
+
+func (p *wsPool) Get() (ws *wsConn, err error) {
+	Again:
+		if p.dial == nil {
+			// Pool is not auto populated
+			// Wait for an available connection
+			ws = <-p.list
+			if ws == nil { return nil, ErrConnectionClosed }
+			if !ws.isConnected() { goto Again }
+			return
+		}
+		select {
+		case ws = <-p.list:
+			// Try to get one connection
+		default:
+			// None available
+			p.lock.Lock()
+			has_free_slot := p.count < p.max
+			if has_free_slot {
+				// Max connection is not reached, reserve a place
+				p.count++
+			}
+			p.lock.Unlock()
+
+			if has_free_slot {
+				// Open a new connection
+				ws, err = p.dial()
+				if err != nil {
+					// Fail to connect, give up the reserved place 
+					p.lock.Lock()
+					p.count--
+					p.lock.Unlock()
+				} else {
+					p.Watch(ws)
+				}
+				return
+			}
+			// Wait for an available connection
+			ws = <-p.list
+		}
+		if ws == nil { return nil, ErrConnectionClosed }
+		if !ws.isConnected() {
+			// Remove lost connection and try again
+			p.lock.Lock()
+			p.count--
+			p.lock.Unlock()
+			goto Again
+		}
+		return
+}
+
+func (p *wsPool) Put(ws *wsConn) {
+	if ws == nil { return }
+	select {
+	case p.list <-ws:
+		// Put connection into the pool
+	default:
+		// Max connection reached, flush it
+		ws.Close()
+	}
+}
+
+func (p *wsPool) Close() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.max == 0 { return } // already closed
+	for i := p.count; i > 0; i-- {
+		ws := <-p.list
+		if ws != nil && ws.isConnected() {
+			ws.Close()
+		}
+	}
+	p.count = 0
+	p.max = 0
+	close(p.list)
+	close(p.ondisconnect)
+}
+
+func (p *wsPool) Prune(target *wsConn) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.count == 0 { return }
+	temp := make([]*wsConn, 0, int(p.max))
+	defer func() {
+		// Put back the conns
+		for _, c := range temp {
+			p.list <-c
+		}
+	}()
+	for {
+		select {
+		case ws := <-p.list:
+			if ws == target {
+				p.count--
+				return
+			} else {
+				temp = append(temp, ws)
+			}
+		default:
+			// Do not block
+			return
+		}
+	}
+}
+
+func (p *wsPool) Watch(ws *wsConn) {
+	p.ondisconnect <-ws.ondisconnect
+}
+
+func (p *wsPool) Wait() {
+	cases := make([]reflect.SelectCase, 1, int(p.max) +1)
+	cases[0] = reflect.SelectCase{Dir: reflect.SelectRecv,
+									Chan: reflect.ValueOf(p.ondisconnect)}
+	for {
+		i, ch, ok := reflect.Select(cases)
+		if i == 0 {
+			if ok {
+				// add another case to watch
+				c := reflect.SelectCase{Dir: reflect.SelectRecv, Chan: ch}
+				cases = append(cases, c)
+			} else { return } // close channel
+		} else {
+			if ok { panic("Should not happen!") }
+			// closed connection, remove it from list
+			last := len(cases) -1
+			if last == 1 { return } // empty list
+			cases[i] = cases[last] // swap with last item
+			cases = cases[:last] // truncate the slice
+		}
+	}
+}
+
+func (p *wsPool) Populate() {
+	if p.dial == nil { return } // Server side can't dial new connection
+
+	for {
+		p.lock.Lock()
+		has_free_slot := p.count < p.max
+		if has_free_slot { p.count++ }
+		p.lock.Unlock()
+		if !has_free_slot { return }
+
+		ws, err := p.dial()
+		if err != nil {
+			p.lock.Lock()
+			p.count--
+			p.lock.Unlock()
+			return
+		} else {
+			p.Watch(ws)
+		}
+		p.Put(ws)
+	}
+}
+
+func (p *wsPool) DePopulate() {
+	if p.dial == nil { return }
+
+	for {
+		p.lock.Lock()
+		has_toomuch_slot := p.count > 1
+		if has_toomuch_slot { p.count-- }
+		p.lock.Unlock()
+		if !has_toomuch_slot { return }
+
+		ws, _ := p.Get()
+		ws.Close()
+	}
+}
+
+// Main connection struct.
+type Conn struct {
+	pool *wsPool
+	srv *service
+	request_id *requestId
+	pending_request *pendingMap
+	streaming *streamingMap
+	ondisconnect chan bool // Event channel. Can be used with select statement
+	value reflect.Value
+	Header *Header
+	id string
+}
+// Use c.IsConnected() or <-c.OnDisconnect() to know when connection is closed.
+
+func newConn(srv *service, dial wsDial) *Conn {
+	c := Conn{pool:newPool(srv.max_conn, dial), srv:srv, request_id:&requestId{},
+			pending_request:newPendingMap(), streaming:newStreamingMap(),
+			ondisconnect:make(chan bool)}
+	c.value = reflect.ValueOf(&c)
+	return &c
+}
+
+func (c *Conn) serve() {
+	// handling Connect/Disconnect events
+	if c.srv.rcvr != nil {
+		go c.srv.rcvr.OnConnect(c)
+		defer c.srv.rcvr.OnDisconnect(c)
+	}
+	c.pool.Wait()
+	c.clean()
+}
+
+func (c *Conn) init(id string, h *Header) {
+	c.Header = h
+	c.id = id
+	c.srv.putMux(id, c)
+}
+
+func (c *Conn) clean() {
+	c.pending_request.dropAll(ErrCanceledLostConn)
+	c.streaming.dropAll(ErrCanceledLostConn)
+	c.srv.removeMux(c.id)
+	c.pool.Close()
+	close(c.ondisconnect)
+}
+
+func (c *Conn) IsConnected() bool {
+	select {
+	case <-c.ondisconnect:
+		return false
+	default:
+		return true
+	}
+}
+
+func (c *Conn) OnDisconnect() chan bool {
+	return c.ondisconnect
+}
+
+func (c *Conn) Close() { c.pool.Close() }
+// func (c *Conn) Request() *http.Request { return c.ws.Request() }
+// func (c *Conn) SetDeadline(t time.Time) error { return c.ws.SetDeadline(t) }
+// func (c *Conn) SetReadDeadline(t time.Time) error { return c.ws.SetReadDeadline(t) }
+// func (c *Conn) SetWriteDeadline(t time.Time) error { return c.ws.SetWriteDeadline(t) }
+
+func (c *Conn) sendJSON(data interface{}) error {
+	ws, err := c.pool.Get()
+	if err != nil { return err }
+	err = websocket.JSON.Send(ws.Conn, data)
+	if err != nil { return err }
+	c.pool.Put(ws)
+	return nil
+}
+func (c *Conn) sendByte(data []byte) error {
+	ws, err := c.pool.Get()
+	if err != nil { return err }
+	_, err = ws.Write(data)
+	if err != nil { return err }
+	c.pool.Put(ws)
+	return nil
+}
+
+// Send a remote call to the connected service. Return a PendingRequest if successful.
+// Sending the request is done synchronously. Waiting for the result is not.
+func (c *Conn) RemoteCall(name string, kwargs, reply interface{}) (pending PendingRequest, err error) {
+	need_response := (reply != nil)
+
+	var id uint32 = 0
+	if need_response {
+		id = c.request_id.get()
+		pending = newPendingRequest(reply)
+		c.pending_request.set(id, pending)
+	}
+	r := response{ID:id, SV:name, KW:kwargs}
+
+	err = c.sendJSON(&r)
+	if err != nil {
+		if need_response {
+			c.pending_request.pop(id)
+			pending = nil
+		}
+		return
+	}
+
+	return
+}
+
+func (c *Conn) sendResponse(id uint32, replyv interface{}, err error) {
+	r_type := "R"
+	if err != nil  {
+		replyv = "(remote) "+ err.Error()
+		r_type = "ERR"
+	}
+
+	r := response{ID: id, SV: r_type, KW: replyv}
+
+	err = c.sendJSON(&r)
+	if err != nil {
+		log.Printf("[ERROR] %s\n", err)
+	}
+}
+
+// Equivalent to RemoteCall(), but expect a binary stream response.
+func (c *Conn) RemoteStream(name string, kwargs interface{}) (pending StreamReceiver, err error) {
+	id := c.request_id.get()
+
+	r := response{ID:id, SV:name, KW:kwargs}
+
+	pending = newPendingWriter(id, c)
+	c.pending_request.set(id, pending)
+
+	err = c.sendJSON(&r)
+	if err != nil {
+		c.pending_request.pop(id)
+		pending = nil
+		return
+	}
+
+	go c.pool.Populate() // Make we have maximum bandwith
+
+	return
+}
+
 // PendingRequest is used to know when a remote call has finished and reply
+
 // value is ready to read.
 type PendingRequest interface {
 	Reply() interface{}
@@ -315,377 +862,6 @@ func (p *pendingRequest) IsDone() bool {
 
 func (p *pendingRequest) HasFailed() bool { return p.error != nil }
 
-// Request id generator
-
-type requestId struct {
-	n uint32
-	lock sync.Mutex
-}
-
-func (rid *requestId) get() uint32 {
-	rid.lock.Lock()
-
-	rid.n++
-	if rid.n == 0 {
-		rid.n = 1
-	}
-
-	rid.lock.Unlock()
-
-	return rid.n
-}
-
-// Main connection struct.
-type Conn struct {
-	ws *websocket.Conn
-	srv *service
-	request_id *requestId
-	pending_request *pendingMap
-	stream_channel chan stream_packet
-	streaming *streamingMap
-	ondisconnect chan bool // Event channel. Can be used with select statement
-	value reflect.Value
-}
-// Use c.IsConnected() or <-c.OnDisconnect() to know when connection is closed.
-
-type streamingMap struct {
-	lock sync.Mutex
-	book map[uint32]StreamSender
-}
-
-func (s *streamingMap) set(id uint32, item StreamSender) {
-	s.lock.Lock()
-	s.book[id] = item
-	s.lock.Unlock()
-}
-
-func (s *streamingMap) pop(id uint32) (item StreamSender) {
-	s.lock.Lock()
-	item = s.book[id]
-	if item != nil {
-		delete(s.book, id)
-	}
-	s.lock.Unlock()
-	return
-}
-
-func (s *streamingMap) dropAll(err error) {
-	s.lock.Lock()
-	for id, item := range s.book {
-		item.setError(err)
-		delete(s.book, id)
-	}
-	s.lock.Unlock()
-}
-
-func newStreamingMap() *streamingMap {
-	return &streamingMap{book:make(map[uint32]StreamSender)}
-}
-
-type pendingMap struct {
-	lock sync.RWMutex
-	book map[uint32]PendingRequest
-}
-
-func (s *pendingMap) set(id uint32, item PendingRequest) {
-	s.lock.Lock()
-	s.book[id] = item
-	s.lock.Unlock()
-}
-
-func (s *pendingMap) pop(id uint32) (item PendingRequest) {
-	s.lock.Lock()
-	item = s.book[id]
-	if item != nil {
-		delete(s.book, id)
-	}
-	s.lock.Unlock()
-	return
-}
-
-func (s *pendingMap) peek(id uint32) (item PendingRequest) {
-	s.lock.RLock()
-	item = s.book[id]
-	s.lock.RUnlock()
-	return
-}
-
-func (s *pendingMap) dropAll(err error) {
-	s.lock.Lock()
-	for id, item := range s.book {
-		item.setError(err)
-		delete(s.book, id)
-	}
-	s.lock.Unlock()
-}
-
-func newPendingMap() *pendingMap {
-	return &pendingMap{book:make(map[uint32]PendingRequest)}
-}
-
-func newConn(ws *websocket.Conn, srv *service) *Conn {
-	ws.PayloadType = websocket.BinaryFrame // Default to binary frame for stream
-	c := Conn{ws:ws, srv:srv, request_id:&requestId{},
-				pending_request:newPendingMap(), streaming:newStreamingMap()}
-	c.value = reflect.ValueOf(&c)
-	return &c
-}
-
-func (c *Conn) connected() {
-	c.ondisconnect = make(chan bool)
-	c.stream_channel = make(chan stream_packet)
-	go c.streamSender()
-}
-
-func (c *Conn) IsConnected() bool {
-	select {
-	case <-c.ondisconnect:
-		return false
-	default:
-		return true
-	}
-}
-
-func (c *Conn) OnDisconnect() chan bool {
-	return c.ondisconnect
-}
-
-func (c *Conn) disconnected() {
-	close(c.ondisconnect)
-	close(c.stream_channel)
-	c.pending_request.dropAll(ErrCanceledLostConn)
-	c.streaming.dropAll(ErrCanceledLostConn)
-}
-
-func (c *Conn) Close() error { return c.ws.Close() }
-func (c *Conn) Request() *http.Request { return c.ws.Request() }
-func (c *Conn) SetDeadline(t time.Time) error { return c.ws.SetDeadline(t) }
-func (c *Conn) SetReadDeadline(t time.Time) error { return c.ws.SetReadDeadline(t) }
-func (c *Conn) SetWriteDeadline(t time.Time) error { return c.ws.SetWriteDeadline(t) }
-
-
-// Send a remote call to the connected service. Return a PendingRequest if successful.
-// Sending the request is done synchronously. Waiting for the result is not.
-func (c *Conn) RemoteCall(name string, kwargs, reply interface{}) (pending PendingRequest, err error) {
-	need_response := (reply != nil)
-
-	var id uint32 = 0
-	if need_response {
-		id = c.request_id.get()
-	}
-	r := response{ID:id, SV:name, KW:kwargs}
-
-	err = websocket.JSON.Send(c.ws, &r)
-
-	if err != nil {
-		return
-	}
-
-	if !need_response {
-		return
-	}
-
-	pending = newPendingRequest(reply)
-	c.pending_request.set(id, pending)
-
-	return
-}
-
-func (c *Conn) readMessage() (m message, err error) {
-	err = MESSAGE.Receive(c.ws, &m)
-	return
-}
-
-func (c *Conn) sendResponse(id uint32, replyv interface{}, err error) {
-	r_type := "R"
-	if err != nil  {
-		replyv = "(remote) "+ err.Error()
-		r_type = "ERR"
-	}
-
-	r := response{ID: id, SV: r_type, KW: replyv}
-
-	err = websocket.JSON.Send(c.ws, &r)
-	if err != nil {
-		log.Printf("[ERROR] %s\n", err)
-	}
-}
-
-func (msg *request) process(c *Conn) {
-	switch msg.SV {
-	case "ERR":
-		fallthrough
-	case "R":
-		err := msg.handleResponse(c)
-		if err != nil {
-			log.Println("[ERROR] "+ err.Error())
-		}
-
-	case "CANCEL":
-		// Cancel Stream
-		msg.handleCancel(c)
-
-	default:
-		err := msg.handleRequest(c)
-		if err != nil {
-			if msg.ID != 0 {
-				go c.sendResponse(msg.ID, nil, err)
-
-			} else {
-				log.Println("[ERROR] "+ err.Error())
-			}
-		}
-	}
-}
-
-func (resp *request) handleResponse(c *Conn) (err error) {
-	pending := c.pending_request.pop(resp.ID)
-	if pending == nil {
-		return ErrUnknownPendingRequest
-	}
-
-	// Decode Response content(KW) depending of the SV type (error or reply data)
-	if resp.SV == "ERR" {
-		var errMsg string
-		err = json.Unmarshal(resp.KW, &errMsg)
-		if err == nil {
-			pending.setError(errors.New(errMsg))
-		} else {
-			pending.setError(err)
-		}
-		return
-	}
-	
-	err = json.Unmarshal(resp.KW, pending.Reply())
-	if err != nil {
-		pending.setError(err)
-		return
-	}
-
-	pending.done()
-	return
-}
-
-func (req *request) handleCancel(c *Conn) {
-	sender := c.streaming.pop(req.ID)
-	if sender != nil {
-		sender.setError(ErrCanceled)
-	}
-}
-
-func (req *request) handleRequest(c *Conn) (err error) {
-
-	methodName := req.SV
-	dot := strings.LastIndex(methodName, ".")
-	if dot < 0 {
-		err = errors.New("wsrpc: service/method request ill-formed: "+ methodName)
-		return
-	}
-
-	// Look up the request.
-	s := c.srv
-	if s == nil {
-		err = ErrNoServices
-		return
-	}
-	mtype := s.method[methodName]
-	if mtype == nil {
-		err = errors.New("wsrpc: can't find method "+ methodName)
-		return
-	}
-
-	// Create the argument value.
-	var argv, replyv reflect.Value
-	argIsValue := false // if true, need to indirect before calling.
-	if mtype.ArgType.Kind() == reflect.Ptr {
-		argv = reflect.New(mtype.ArgType.Elem())
-	} else {
-		argv = reflect.New(mtype.ArgType)
-		argIsValue = true
-	}
-
-	// Decode Request content(KW) depending of the Service (SV) now that an
-	// empty argv was created to receive the data.
-	err = json.Unmarshal(req.KW, argv.Interface())
-	if err != nil {
-		return
-	}
-	if argIsValue {
-		argv = argv.Elem()
-	}
-
-	stream := false
-	if mtype.ReplyType == typeOfStream {
-		sender := newStreamer(req.ID, c)
-		c.streaming.set(req.ID, sender)
-		replyv = reflect.ValueOf(sender)
-		stream = true
-
-	} else {
-		replyv = reflect.New(mtype.ReplyType.Elem())
-	}
-
-	go call(c, req.ID, mtype, argv, replyv, stream)
-
-	return
-}
-
-func call(c *Conn, id uint32, mtype *methodType, argv, replyv reflect.Value, stream bool) {
-	// defer func () { // Trap panic ???
-	// 	if r := recover(); r != nil {
-	// 		err = errors.New(fmt.Sprintf("%s", r))
-	// 	}
-	// }()
-	// Invoke the method, providing a new value for the reply.
-	function := mtype.method.Func
-	returnValues := function.Call([]reflect.Value{c.srv.v_rcvr, c.value, argv, replyv})
-	// The return value for the method is an error.
-	errInter := returnValues[0].Interface()
-	var err error
-	if errInter != nil {
-		err = errInter.(error)
-	}
-
-	if id != 0 {
-		if !stream {
-			c.sendResponse(id, replyv.Interface(), err)
-
-		} else if err != nil {
-			// Send only error to stream
-			// But first check if the stream was completed
-			stream := replyv.Interface().(StreamSender)
-			if !stream.IsDone() {
-				stream.setError(err)
-			}
-			c.sendResponse(id, nil, err)
-		}
-
-	} else if err != nil {
-		log.Println("[ERROR] "+ err.Error())
-	}
-}
-
-func (c *Conn) streamSender() {
-	for s := range c.stream_channel {
-		c.ws.Write(s)
-	}
-}
-
-// Equivalent to RemoteCall(), but expect a binary stream response.
-// Reply destination (dst) must io.Writer.
-func (c *Conn) RemoteStream(name string, kwargs interface{}) (pending StreamReceiver, err error) {
-	id := c.request_id.get()
-
-	r := response{ID:id, SV:name, KW:kwargs}
-
-	err = websocket.JSON.Send(c.ws, &r)
-	if err != nil { return }
-
-	pending = newPendingWriter(id, c)
-	c.pending_request.set(id, pending)
-
-	return
-}
 
 // Stream sender
 
@@ -708,7 +884,7 @@ type streamer struct {
 	c *Conn
 	id uint32
 	id_b []byte
-	seq uint8
+	seq uint16
 	packet_total uint64
 	packet_sent uint64
 	ondone chan bool
@@ -729,10 +905,10 @@ func PacketRequire(length uint64) uint64 {
 	return n
 }
 
-func recoverFromCloseChannel() bool {
-	if recover() != nil { return true }
-	return false
-}
+// func recoverFromCloseChannel() bool {
+// 	if recover() != nil { return true }
+// 	return false
+// }
 
 func (s *streamer) Send(data []byte) error {
 	s.progress.Lock()
@@ -744,9 +920,7 @@ func (s *streamer) Send(data []byte) error {
 	seq := s.seq
 	s.progress.Unlock()
 
-	if s.sendPacket(newStream(s.id_b, seq, data)) { return nil }
-
-	return s.error
+	return s.sendPacket(newStream(s.id_b, seq, data))
 }
 
 func (s *streamer) End() {
@@ -759,18 +933,16 @@ func (s *streamer) End() {
 	seq := s.seq
 	s.progress.Unlock()
 
-	if s.sendPacket(endOfStream(s.id_b, seq)) { s.done() }
+	if s.sendPacket(endOfStream(s.id_b, seq)) == nil { s.done() }
 }
 
-func(s *streamer) sendPacket(packet stream_packet) (result bool) {
-	defer recoverFromCloseChannel()
-	select {
-	case s.c.stream_channel <-packet:
-		return true
-
-	case <-s.ondone:
-		return false
-	}
+func(s *streamer) sendPacket(packet stream_packet) error {
+	// return s.c.sendByte(packet) // One Connection
+	// Multiple Connections
+	ws, err := s.c.pool.Get()
+	if err != nil { return err }
+	ws.sendByte(packet)
+	return nil
 }
 
 func (s *streamer) SendFile(r io.Reader, length uint64) (err error) {
@@ -789,12 +961,11 @@ func (s *streamer) SendFile(r io.Reader, length uint64) (err error) {
 	id_b := s.id_b
 	b := make([]byte, MaxChunkSize)
 	// Payload first
-	if !s.sendPacket(newPayload(id_b, length)) {
-		return s.error
-	}
+	err = s.sendPacket(newPayload(id_b, length))
+	if err != nil { return }
 	// Loop through all chunks
 	var i uint64
-	var seq uint8 = 1
+	var seq uint16 = 1
 	for i = 0; i < n; i++ {
 		seq++
 
@@ -807,9 +978,8 @@ func (s *streamer) SendFile(r io.Reader, length uint64) (err error) {
 			return ErrNoMoreData
 		}
 
-		if !s.sendPacket(newStream(id_b, seq, b[:nr])) {
-			return s.error
-		}
+		err = s.sendPacket(newStream(id_b, seq, b[:nr]))
+		if err != nil { return }
 
 		length -= uint64(nr)
 		s.progress.Lock()
@@ -819,9 +989,8 @@ func (s *streamer) SendFile(r io.Reader, length uint64) (err error) {
 
 	// Send end of feed
 	seq++
-	if !s.sendPacket(endOfStream(id_b, seq)) {
-		return s.error
-	}
+	err = s.sendPacket(endOfStream(id_b, seq))
+	if err != nil { return }
 
 	s.done()
 
@@ -833,7 +1002,7 @@ func (s *streamer) Cancel() error {
 
 	s.setError(ErrCanceled)
 
-	return websocket.JSON.Send(s.c.ws, &r)
+	return s.c.sendJSON(&r)
 }
 
 func (s *streamer) setError(err error) {
@@ -909,13 +1078,46 @@ type StreamReceiver interface {
 	ReceiveFile(io.Writer) error
 }
 
+type bytePacket struct {
+	data []byte
+	next *bytePacket
+}
+
+type byteList struct {
+	head *bytePacket
+	tail *bytePacket
+}
+
+func (l *byteList) Append(data []byte) {
+	new_p := &bytePacket{data, nil}
+	if l.tail != nil {
+		l.tail.next = new_p
+	} else {
+		l.head = new_p
+	}
+	l.tail = new_p
+}
+
+func (l *byteList) Pop() []byte {
+	first_p := l.head
+	if first_p == nil { return nil }
+	l.head = first_p.next
+	if l.head == nil { l.tail = nil }
+	return first_p.data
+}
+
+func (l *byteList) IsEmpty() bool {
+	return l.head == nil
+}
+
 type pendingWriter struct {
 	pendingRequest
 	id uint32
 	c *Conn
-	queue chan []byte
-	seq_buffer map[uint8][]byte
-	seq uint8
+	queue *byteList
+	towrite chan bool
+	seq_cache [65536][]byte
+	seq uint16
 	writing sync.Mutex
 	progress sync.RWMutex
 	packet_total uint64
@@ -925,7 +1127,7 @@ type pendingWriter struct {
 func newPendingWriter(id uint32, c *Conn) StreamReceiver {
 	return &pendingWriter{
 		pendingRequest:pendingRequest{ondone:make(chan bool)},
-		id:id, c:c, queue:make(chan []byte, 256), seq_buffer:make(map[uint8][]byte),
+		id:id, c:c, towrite:make(chan bool, 1), queue:new(byteList),
 	}
 }
 
@@ -933,46 +1135,63 @@ func (p *pendingWriter) write(s stream_packet) (done bool) {
 	p.writing.Lock()
 	defer p.writing.Unlock()
 
+	// // One Connection
+	// data := s.get_data()
+	// p.notifyToWrite()
+	// if len(data) == 0 {
+	// 	// Empty data means end of feed
+	// 	return true
+	// }
+	// p.queue.Append(data)
+	// return false
+
+	// Multiple Connection
 	seq := s.get_seq()
 	data := s.get_data()
 	next_seq := p.seq + 1
 	if next_seq == seq {
+		p.notifyToWrite()
 		if len(data) == 0 {
 			// Empty data means end of feed
 			return true
 		}
-		p.queue <- data
-		p.seq, done = p.write_buffer(next_seq)
+		p.queue.Append(data)
+		p.seq, done = p.getCache(seq)
 
 	} else {
-		p.seq_buffer[seq] = data
+		p.seq_cache[seq] = data
 	}
 	return
 }
 
-func (p *pendingWriter) write_buffer(seq uint8) (uint8, bool) {
-	if len(p.seq_buffer) > 0 {
+func (p *pendingWriter) notifyToWrite() {
+	select { // Notify data is ready
+	case p.towrite <-true:
+	default :
+	}
+}
+
+func (p *pendingWriter) getCache(seq uint16) (uint16, bool) {
 	loop:
 		next_seq := seq + 1
-		data, ok := p.seq_buffer[next_seq]
-		if ok {
-			seq = next_seq
+		data := p.seq_cache[next_seq]
+		if data != nil {
 			if len(data) > 0 {
-				p.queue <- data
-				delete(p.seq_buffer, next_seq)
+				p.queue.Append(data)
+				p.seq_cache[next_seq] = nil
+				seq = next_seq
 				goto loop
 			}
 			// Empty data means end of feed
 			return seq, true
 		}
-	}
 	return seq, false
 }
 
 func (p *pendingWriter) done() {
 	p.pendingRequest.done()
 	p.writing.Lock()
-	close(p.queue)
+	close(p.towrite)
 	p.writing.Unlock()
 }
 
@@ -983,25 +1202,39 @@ func (p *pendingWriter) setError(err error) {
 
 // Empty data and error == nil means closed stream.
 func (p *pendingWriter) Receive() ([]byte, error) {
-	data := <- p.queue
+	var data []byte
+	if <-p.towrite || !p.queue.IsEmpty() {
+		p.writing.Lock()
+		data = p.queue.Pop()
+		if !p.queue.IsEmpty() && !p.IsDone() { p.notifyToWrite() }
+		p.writing.Unlock()
+	}
 	return data, p.error
 }
 
 func (p *pendingWriter) ReceiveFile(dst io.Writer) error {
 	// Very first packet is payload
-	data := <- p.queue
-	if data == nil { return p.error }
+	data, err := p.Receive()
+	if data == nil { return err }
 	if len(data) != 8 {
-		err := errors.New("wsrpc: Wrong bytes size for payload.")
+		err = errors.New("wsrpc: Wrong bytes size for payload.")
 		p.setError(err)
 		return err
 
 	}
 	p.setPacketRequire(decodePayload(data))
 
-	for data := range p.queue {
-		dst.Write(data)
-		p.incrementPacketSent()
+	for <-p.towrite || !p.queue.IsEmpty() {
+		p.writing.Lock()
+		for data = p.queue.Pop(); data != nil; data = p.queue.Pop() {
+			_, err = dst.Write(data)
+			if err != nil {
+				p.writing.Unlock()
+				return err
+			}
+			p.incrementPacketSent()
+		}
+		p.writing.Unlock()
 	}
 
 	return p.error
@@ -1031,144 +1264,7 @@ func (p *pendingWriter) Cancel() error {
 	p.c.pending_request.pop(p.id)
 	p.setError(ErrCanceled)
 
-	return websocket.JSON.Send(p.c.ws, &r)
+	return p.c.sendJSON(&r)
 }
-
-// Stream packet (implement message interface)
-
-func (s stream_packet) get_id() []byte {
-	return s[:4]
-}
-func (s stream_packet) get_seq() uint8 {
-	return s[4]
-}
-func (s stream_packet) get_data() []byte {
-	return s[5:]
-}
-
-func (s stream_packet) request_id() uint32 {
-	return binary.BigEndian.Uint32(s[:4])
-}
-
-func (s stream_packet) isPayload() bool {
-	return s.get_seq() == 0 && len(s.get_data()) == 8
-}
-
-func (s stream_packet) process(c *Conn) {
-	id := decodeId(s.get_id())
-	pending := c.pending_request.peek(id)
-
-	if pending == nil {
-		log.Println("[ERROR] "+ ErrUnknownPendingRequest.Error())
-		return
-	}
-
-	if pending.IsDone() { return }
-
-	if pending.write(s) {
-		c.pending_request.pop(id)
-		pending.done()
-	}
-}
-
-func newStream(id []byte, seq uint8, data []byte) stream_packet {
-	var s stream_packet = make([]byte, len(data) + 5)
-	copy(s, id[:4])
-	s[4] = seq
-	copy(s[5:], data)
-
-	return s
-}
-
-func endOfStream(id []byte, seq uint8) stream_packet {
-	return newStream(id, seq, []byte(""))
-}
-
-func newPayload(id []byte, v uint64) stream_packet {
-	data := make([]byte, 8)
-	binary.BigEndian.PutUint64(data, v)
-
-	return newStream(id, 1, data)
-}
-
-func decodePayload(data []byte) uint64 {
-	return binary.BigEndian.Uint64(data)
-}
-
-func decodeId(data []byte) uint32 {
-	return binary.BigEndian.Uint32(data)
-}
-
-func GenerateStreamId() []byte {
-	b := make([]byte, 4)
-	rand.Read(b)
-	return b
-}
-
-func toStreamId(id uint32) []byte {
-	id_b := make([]byte, 4)
-	binary.BigEndian.PutUint32(id_b, id)
-	return id_b
-}
-
-// Binary stream codec
-
-func stream_marshal(v interface{}) (msg []byte, payloadType byte, err error) {
-	return v.(stream_packet), websocket.BinaryFrame, nil
-}
-
-func stream_unmarshal(msg []byte, payloadType byte, v interface{}) error {
-	b, ok := v.(*stream_packet)
-	if !ok {
-		return errors.New("Interface is not of the right type. Expected *stream_packet.")
-		// Usage:
-		//  var s stream_packet = make(stream_packet, 0)
-		//  STREAM.Receive(ws, &s)
-	}
-	*b = msg
-
-	return nil
-}
-
-var STREAM = websocket.Codec{stream_marshal, stream_unmarshal}
-
-
-func message_marshal(v interface{}) (msg []byte, payloadType byte, err error) {
-
-	switch data := v.(type) {
-
-	case stream_packet:
-		return data, websocket.BinaryFrame, nil
-
-	default:
-		msg, err = json.Marshal(v)
-		return []byte(msg), websocket.TextFrame, nil
-
-	}
-
-}
-
-func message_unmarshal(msg []byte, payloadType byte, v interface{}) (err error) {
-
-	switch payloadType {
-
-	case websocket.BinaryFrame:
-		*v.(*message) = stream_packet(msg)
-
-	case websocket.TextFrame:
-		s := new(request)
-		err = json.Unmarshal(msg, s)
-		if err != nil {
-			return
-		}
-		*v.(*message) = s
-
-	}
-
-	return
-}
-
-var MESSAGE = websocket.Codec{message_marshal, message_unmarshal}
-
 
 

@@ -4,7 +4,8 @@
 This library came to be as a need for an unify RPC protocol that could received remote request from different language and unstandard client-slave or both way request.  
 **Websocket** is used as transport layer and **JSON** as message encoding.  
 This make it easy to be implemented in Javascript and other language like Go or Python.
-The protocol also support **binary stream** through an opened channel and an interface to send file like object.
+The protocol also support **binary stream** through an opened channel and an interface to send file like object.  
+There is the possibility to use a pool of parallel connections to receive and send data. Binary data is resequenced on arrival.
 
 This paradigm makes it possible to have agents connect to a central server as RPC *server* and client *front-end* to the central server as RPC *client*. The central server is basically a **hub**.
 
@@ -56,13 +57,18 @@ Remote call are possible through the **wsrpc.Conn** object passed to the service
 **Service** is an interface that require this signatures:
 ```go
 type Service interface {
-	OnConnect(c *wsrpc.Conn)
-	OnDisconnect(c *wsrpc.Conn)
+	OnHandshake(*wsrpc.Header) error
+	OnConnect(*wsrpc.Conn)
+	OnDisconnect(*wsrpc.Conn)
 }
 ```
+**OnHandshake** give the opportunity to implement custom handshake by setting properties to **wsrpc.Header**. The client side is sending the header first and wait for a returned header. The server validate the properties in the header and send back a header. If the properties are not valid, return an error. The client then receive the header back. If the header contains the '**error**' property the connection is aborded.  
+When **OnHanshake()** is called on either side this is the opportunity to add (client side) or validate (server side) values.  
 **OnConnect** and **OnDisconnect** are events callback triggered at the apropriate time.  
-**wsrpc.Conn** represent the connection to the remote end. Through that instance you may send remote request or query connection (ie: *conn.IsConnected()*).  
-To expose service methods they must satify these criteria:
+**OnConnect()** is called just after **OnHandshake()**. **OnDisconnect()** is called just after the socket connection is closed.  
+**wsrpc.Conn** represent the connection to the remote end. Through that instance you may send remote request or process some clean up.  
+
+**To expose service** methods they must satify these criteria:
  - the method's type is exported.
  - the method is exported.
  - the method has three arguments
@@ -85,6 +91,10 @@ func (t *MyServices) MyFunc(cnx *wsrpc.Conn, kwargs *data.Kwargs, reply *string)
 	log.Printf("[INFO] %s\n", kwargs.A)
 	*reply = kwargs.A
 	return
+}
+
+func (t *MyServices) OnHandshake(h *wsrpc.Header) error {
+	return nil
 }
 
 func (t *MyServices) OnConnect(cnx *wsrpc.Conn) {
@@ -184,6 +194,23 @@ If no value need to be sent or returned **KW** must be set to **null**. When sen
 {"ID": 0, "SV": "Send.NoReply", "KW": null} //Request
 ```
 
+## Binary data packet
+
+When sending binary data, these packet are identify in two ways. The first 4 bytes are the request ID, the next 2 bytes are the sequence number (used to order packet in case of parallel connections). The rest is the actual binary data.
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++---------------------------------------------------------------+
+|                      ID Token (4 bytes)                       |
++-------------------------------+-------------------------------+
+|     Sequence (2 bytes)        |      Payload Data             |
++ - - - - - - - - - - - - - - - + - - - - - - - - - - - - - - - +
+|                                                               |
+.                                                               .
+The very first packet sequence number must be 1, it is a uint16 encoded in big endian.
+When sending data through **SendFile()**, the very first packet contains a data that represent the payload size encoded in uint64 big endian. The follwing data packets are sent by chuncks of size equal to **wsrpc.MaxChunkSize** or less (for the last packet).
+This is only true when sending data through **SendFile()** otherwise the size is arbitrary.
+When closing a stream an *End of Stream* packet is sent. This packet contains an empty data (payload of 0).
+
 ## API Reference
 
 ### Constructors:
@@ -213,8 +240,14 @@ Block until Node is connected to a server.
 ```go
 func (n *Node) SetReconnect(elapse uint16)
 ```
-Set time that elapse between 2 reconnections attempt. By default there is no reconnection attempt if connection fails or connection is lost. Setting a value superior to 0 will enable that feature. Setting it to 0 will disable the feature.
+Set time that elapse between 2 reconnections attempt. By default there is no reconnection attempt if connection fails or connection is lost. Setting a value superior to 0 will enable that feature. Setting it to 0 will disable the feature.  
 The value is in second.
+
+```go
+func (n *Node) SetMaxSocket(max uint8)
+```
+Set the maximum number of parallel socket connections. This is an optimization feature to maximize bandwith usage when streaming binary data. Binary packets are split across several parallel connections. Data is resequenced on arrival.  
+Default value is 1. Maximum value is 255. Sweet spot is generaly 4. Too much connections might clutter the goroutine scheduler and cause leak.  
 
 ```go
 func (n *Node) Serve()
@@ -233,8 +266,13 @@ Wait for a connection to be established and return a Conn object.
 
 ### type Conn
 ```go
-type Conn struct { }
+type Conn struct {
+	Header *Header
+}
 ```
+Conn object gives you access to the Header used during connection validation.
+If parallel connections are allowed, this Header will be use to validate these connections. Modification to the Header can be done accordingly (ie: token update).
+
 ```go
 func (c *Conn) OnDisconnect() chan bool
 ```
@@ -277,29 +315,30 @@ func (c *Conn) Close() error
 ```
 Close connection.
 
-```go
-func (c *Conn) Request() *http.Request
-```
-This is to aligned with **websocket.Conn** interface.  
-Return the **http.Request** object if connection is on the server side. On the client side it will return nil.
+### type Header
+Object type passed as argument to **OnHandshake()**. You may add properties to is on the client side, and read/validate properties on the server side.
+The only required and default property is *'channel'* which is used to group parallel connections together.
 
 ```go
-func (c *Conn) SetDeadline(t time.Time) error
+func (h *Header) Has(key string) bool
 ```
-This is to aligned with **websocket.Conn** interface.  
-Sets the connection's network read & write deadlines.
+Test if a property exists.
 
 ```go
-func (c *Conn) SetReadDeadline(t time.Time) error
+func (h *Header) Get(key string) interface{}
 ```
-This is to aligned with **websocket.Conn** interface.  
-Sets the connection's network read deadline.
+Return a property from the header. Use type assertion to convert the property to the desired type *(ie: header.Get("token").(string) )*.
 
 ```go
-func (c *Conn) SetWriteDeadline(t time.Time) error
+func (h *Header) Set(key string, data interface{})
 ```
-This is to aligned with **websocket.Conn** interface.  
-Sets the connection's network write deadline.
+Add a property to the header.
+**Note** that the header is sent as **JSON**, for that reason sent data must be supported by the format.
+
+```go
+func (h *Header) Delete(key string)
+```
+Delete a property from the header.
 
 ### type PendingRequest
 ```go
@@ -367,17 +406,22 @@ func (s StreamReceiver) Receive() ([]byte, error)
 ```
 The method wait until the incoming binary data packet is received.
 If bytes data is empty and err is nil, the stream has been closed.  
+**Note** that if data is received but not read through either this method or **ReceiveFile()** data is cached on memory. Application might leak if not read in a timely fashion.  
+
 ```go
 func (s StreamReceiver) ReceiveFile(io.Writer) error
 ```
 Binary packets are writen directly into the *io.Writer* object. The method block until the stream is closed.  
 This method is designed to be use in conjunction with **StreamSender.SendFile()** method on the other end.  
 When data are received this way, the first packet sent is expected to be the payload encoded as a uint64 in big-endian for tracking purposes. **SendFile()** does that step automaticaly.  
-The rest of the data is expected to be received by small chunks until the payload is reached.
+The rest of the data is expected to be received by small chunks until the payload is reached.  
+**Note** that if data is received but not read through either this method or **Receive()** data is cached on memory. Application might leak if not read in a timely fashion.  
+
 ```go
 func (s StreamReceiver) Cancel() error
 ```
 Cancel the current stream request by notifying the remote end.
+
 ```go
 func (s StreamReceiver) Progress() (uint64, uint64)
 ```
@@ -407,23 +451,23 @@ type StreamSender interface {
 ```
 
 ```go
-func (s StreamReceiver) Send(data []byte) error
+func (s StreamSender) Send(data []byte) error
 ```
 Send the bytes to the remote end.
 ```go
-func (s StreamReceiver) SendFile(src io.Reader, length uint64) error
+func (s StreamSender) SendFile(src io.Reader, length uint64) error
 ```
 Send *length* bytes from **io.Reader**. Block until everything was sent.
 ```go
-func (s StreamReceiver) End()
+func (s StreamSender) End()
 ```
 Close the stream.
 ```go
-func (s StreamReceiver) Cancel() error
+func (s StreamSender) Cancel() error
 ```
 Cancel the current stream request by notifying the remote end.
 ```go
-func (s StreamReceiver) Progress() (uint64, uint64)
+func (s StreamSender) Progress() (uint64, uint64)
 ```
 Return the current progress when using **SendFile()** method.  
 **StreamSender.SendFile()** send data in chunks based on the length of bytes read from the *io.Reader* . It is that progression that is returned.

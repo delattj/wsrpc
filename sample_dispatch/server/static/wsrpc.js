@@ -35,90 +35,117 @@
 //
 // function my_callback(node, reply)
 
-function _wsrpc()
+var wsrpc = (function()
 {
-	var isset = function(v) { return v != undefined }
-	var _last_id = 0;
-	var generate_id = function()
-	{ // limit to unsigned 32-bit integer and avoid 0 (0 id mean no response)
-		return ++_last_id >>> 0 || ++_last_id >>> 0;
-	}
-
-	this.Node = function(
-			server,
-			onopen_cb,
-			onconnectfail_cb,
-			onclose_cb,
-			onerror_cb
-		)
+	function _wsrpc()
 	{
-	//// Private
-		var _ws = new WebSocket(server);
-		var _parent = this;
-		var _connected = false;
-		_ws.onopen = function()
-		{
-			_connected = true;
-			if(onopen_cb) onopen_cb(_parent);
+		var isset = function(v) { return v !== undefined }
+		var _rand32 = function(){
+			var bytes = new Uint8Array(4);
+			window.crypto.getRandomValues(bytes);
+			var uint = new Uint32Array(bytes.buffer)[0];
+			return uint;
 		}
-		_ws.onclose = function()
+		var _last_id = 0;
+		var generate_id = function()
+		{ // limit to unsigned 32-bit integer and avoid 0 (0 id mean no response)
+			//return _rand32() || _rand32();
+			return ++_last_id >>> 0 || ++_last_id >>> 0;
+		}
+
+		this.Node = function(
+				server,
+				onopen_cb,
+				onconnectfail_cb,
+				onclose_cb,
+				onerror_cb
+			)
 		{
-			if(!_connected)
+		//// Private
+			var _ws = new WebSocket(server);
+			var _parent = this;
+			var _header = {channel:""};
+			var _connected = false;
+			_ws.binaryType = 'arraybuffer';
+			_ws.onopen = function()
 			{
-				if(onconnectfail_cb)
+				// Send handshake
+				_ws.send(JSON.stringify(_header));
+			}
+			_ws.onclose = function()
+			{
+				if(!_connected)
 				{
-					onconnectfail_cb(_parent);
-					return;
+					if(onconnectfail_cb)
+					{
+						onconnectfail_cb(_parent);
+						return;
+					}
+					else
+						_onerror('Could not connect to server '+server);
 				}
+				_connected = false;
+				if(onclose_cb) onclose_cb(_parent);
+			}
+			_ws.onerror = function(e)
+			{
+				_onerror(e.data);
+			}
+			_ws.onhandshake = function(header)
+			{
+				_header = header;
+				var id = header.channel;
+				if(!id) throw new Error('Handshake failed!');
+				var error = header.error;
+				if(isset(error)) throw new Error(error);
+				_connected = true;
+				if(onopen_cb) onopen_cb(_parent);
+			}
+			_ws.onmessage = function (e)
+			{
+				var r_object = JSON.parse(e.data);
+				if (!_connected) {
+					_ws.onhandshake(r_object);
+					return
+				}
+				var id = r_object['ID'];
+				if(!isset(id)) return;
+				var callback = _callbacks[id];
+				delete _callbacks[id];
+				var error = r_object['SV'] == 'ERR';
+				if(error)
+					_onerror("Remote Exception:\n"+ r_object['KW']);
 				else
-					_onerror('Could not connect to server '+server);
-			}
-			_connected = false;
-			if(onclose_cb) onclose_cb(_parent);
-		}
-		_ws.onerror = function(e)
-		{
-			_onerror(e.data);
-		}
-		_ws.onmessage = function (e)
-		{
-			var r_object = JSON.parse(e.data);
-			var id = r_object['ID'];
-			if(!isset(id)) return;
-			var callback = _callbacks[id];
-			delete _callbacks[id];
-			var error = r_object['SV'] == 'ERR';
-			if(error)
-				_onerror("Remote Exception:\n"+ r_object['KW']);
-			else
-			{ // assume response (SV == 'R')
-				if(isset(callback))
-				{
-					var value = r_object['KW'];
-					if(isset(value)) callback(_parent, value);
+				{ // assume response (SV == 'R')
+					if(isset(callback))
+					{
+						var value = r_object['KW'];
+						if(isset(value)) callback(_parent, value);
+					}
 				}
-			}
-		};
-		var _callbacks = new Object();
-		var _onerror = function(data)
-		{
-			if(onerror_cb) onerror_cb(_parent, data);
-			else throw new Error(data);
-		}
-	//// Public
-		this.close = function() { _ws.close(); }
-		this.remote_call = function (name, kwargs, callback)
-		{
-			if(_connected)
+			};
+			var _callbacks = new Object();
+			var _onerror = function(data)
 			{
-				var id = isset(callback)? generate_id() : 0;
-				if(id) _callbacks[id] = callback;
-				var call_object = {ID:id, SV:name, KW:kwargs};
-				_ws.send(JSON.stringify(call_object));
+				if(onerror_cb) onerror_cb(_parent, data);
+				else throw new Error(data);
 			}
-			else throw new Error('Not connected to server '+server);
+		//// Public
+			this.close = function() { _ws.close(); }
+			this.remote_call = function (name, kwargs, callback)
+			{
+				if(_connected)
+				{
+					var id = isset(callback)? generate_id() : 0;
+					if(id) _callbacks[id] = callback;
+					var call_object = {ID:id, SV:name, KW:kwargs};
+					_ws.send(JSON.stringify(call_object));
+				}
+				else throw new Error('Not connected to server '+server);
+			}
+			this.get_header = function() { return _header; }
 		}
 	}
-}
 
-var wsrpc = new _wsrpc();
+	return new _wsrpc();
+})();

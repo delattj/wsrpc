@@ -4,6 +4,7 @@ import (
 	"os"
 	"log"
 	"sync"
+	"flag"
 	"net/http"
 	"html/template"
 	"../../../wsrpc"
@@ -38,6 +39,10 @@ func (w *Web) Dispatch(cnx *wsrpc.Conn, kwargs, reply *data.Work) (err error) {
 
 	*reply = *kwargs
 	return
+}
+
+func (w *Web) OnHandshake(header *wsrpc.Header) error {
+	return nil
 }
 
 func (w *Web) OnConnect(cnx *wsrpc.Conn) {
@@ -130,6 +135,9 @@ func (n *Node) GetFile(cnx *wsrpc.Conn, filename string, stream wsrpc.StreamSend
 	return
 }
 
+func (n *Node) OnHandshake(header *wsrpc.Header) error {
+	return nil
+}
 
 func (n *Node) OnConnect(cnx *wsrpc.Conn) {
 	log.Println("[INFO] Node connected")
@@ -148,10 +156,9 @@ func (n *Node) OnDisconnect(cnx *wsrpc.Conn) {
 func main() {
 
 	// Command line arguments
-	port := "8080"
-	if len(os.Args) > 1 {
-		port = os.Args[1]
-	}
+	var port string
+	flag.StringVar(&port, "port", "8080", "Server port.")
+	flag.Parse()
 
 	Nodes = NewNodesManager()
 

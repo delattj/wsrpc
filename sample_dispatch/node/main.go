@@ -5,6 +5,7 @@ import (
 	"net"
 	"log"
 	"time"
+	"flag"
 	"syscall"
 	"os/signal"
 	"../../../wsrpc"
@@ -19,6 +20,10 @@ type Node struct {
 func (n *Node) Dispatch(cnx *wsrpc.Conn, kwargs *data.Work, reply wsrpc.Nothing) (err error) {
 	log.Printf("[INFO] %s\n", kwargs.Name)
 	return
+}
+
+func (n *Node) OnHandshake(header *wsrpc.Header) error {
+	return nil
 }
 
 func (n *Node) OnConnect(cnx *wsrpc.Conn) {
@@ -109,13 +114,12 @@ func main() {
 
 	// Command line arguments
 	var filename string
-	if len(os.Args) > 1 {
-		filename = os.Args[1]
-	}
-	server := "localhost:8080"
-	if len(os.Args) > 2 {
-		server = os.Args[2]
-	}
+	var server string
+	var max_socket uint
+	flag.StringVar(&filename, "filename", "", "File to download.")
+	flag.StringVar(&server, "server", "localhost:8080", "Server to connect to.")
+	flag.UintVar(&max_socket, "max_socket", 2, "Maximum number of parallel socket connection.")
+	flag.Parse()
 
 	// Get Mac Address
 	ifs, _ := net.Interfaces()
@@ -128,6 +132,7 @@ func main() {
 	n.Filename = filename
 
 	ws := wsrpc.NewNode("ws://"+ server +"/node", n)
+	ws.SetMaxSocket(uint8(max_socket))
 	ws.SetReconnect(5) // If disconnected, try reconnecting every 5 seconds
 
 	// Trap Keyboard interrupt and start service
