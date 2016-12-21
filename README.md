@@ -197,6 +197,17 @@ If no value need to be sent or returned **KW** must be set to **null**. When sen
 ## Binary data packet
 
 When sending binary data, these packet are identify in two ways. The first 4 bytes are the request ID, the next 2 bytes are the sequence number (used to order packet in case of parallel connections). The rest is the actual binary data.  
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++---------------------------------------------------------------+
+|                      ID Token (4 bytes)                       |
++-------------------------------+-------------------------------+
+|     Sequence (2 bytes)        |      Payload Data             |
++ - - - - - - - - - - - - - - - + - - - - - - - - - - - - - - - +
+|                                                               |
+.                                                               .
+```
 The very first packet sequence number must be 1, it is a uint16 encoded in big endian.  
 When sending data through **SendFile()**, the very first packet contains a data that represent the payload size encoded in uint64 big endian. The follwing data packets are sent by chuncks of size equal to **wsrpc.MaxChunkSize** or less (for the last packet).  
 This is only true when sending data through **SendFile()** otherwise the size is arbitrary.  
