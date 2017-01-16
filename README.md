@@ -217,9 +217,10 @@ When closing a stream an *End of Stream* packet is sent. This packet contains an
 
 ### Constructors:
 ```go
-wsrpc.Handler(s Service) websocket.Handler
+wsrpc.Handler(s Service, max uint8) websocket.Handler
 ```
-Use to create handler compatible with **http.Handle()**. To create valid **Service** refer to above *Service* section.
+Use to create handler compatible with **http.Handle()**. To create valid **Service** refers to above *Service* section.  
+**max** is maximum number of parallel connection per client permited (255 is the maximum abviously).
 
 ```go
 wsrpc.NewNode(url string, s Service) wsrpc.Node

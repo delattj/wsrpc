@@ -163,8 +163,8 @@ func main() {
 	Nodes = NewNodesManager()
 
 	// Register wsrpc services on the http server
-	http.Handle("/node", wsrpc.Handler(new(Node))) // ws://<host>:<port>/node
-	http.Handle("/web", wsrpc.Handler(new(Web))) // ws://<host>:<port>/web
+	http.Handle("/node", wsrpc.Handler(new(Node), 6)) // ws://<host>:<port>/node
+	http.Handle("/web", wsrpc.Handler(new(Web), 6)) // ws://<host>:<port>/web
 
 	// static files
 	http.Handle("/static/",

@@ -1,15 +1,14 @@
 package wsrpc
 
 import (
-	"log"
 	"io"
-	// "fmt"
+	"log"
+	"net"
 	"sync"
 	"time"
 	"errors"
 	"reflect"
 	"unicode"
-	// "net/http"
 	"crypto/rand"
 	"unicode/utf8"
 	"encoding/hex"
@@ -44,6 +43,8 @@ type Nothing *bool
 // Variable use to signify that no response is necessary to be sent back.
 // In essence it's just nil.
 var NoResponse Nothing
+
+var ConnTimeout = 5 * time.Minute
 
 type methodType struct {
 	method     reflect.Method
@@ -332,6 +333,7 @@ type wsConn struct {
 	ondisconnect chan bool
 	header *Header
 	id string
+	tl_response time.Time
 }
 
 func (c *wsConn) isConnected() bool {
@@ -351,7 +353,7 @@ func (c *wsConn) handshake(srv *service) (err error) {
 		id := header.Get("channel").(string)
 		if id == "" {
 			// New connection, generate random id
-			id = generateHexId(4)
+			id = generateHexId(6)
 		} else {
 			// Validate existing id
 			mux := srv.getMux(id)
@@ -394,23 +396,47 @@ func (c *wsConn) validate(srv *service) error {
 
 func (c *wsConn) clean(mux *Conn) {
 	close(c.ondisconnect)
-	mux.pool.Prune(c)
+	mux.pool.Prune(c, false)
 }
 
 func (c *wsConn) serve(mux *Conn) {
 	defer c.clean(mux)
 	go c.sender(mux)
 	for { // message dispatch loop
+		if c.IsServerConn() {
+			c.SetDeadline(time.Now().Add(ConnTimeout))
+		} else {
+			c.tl_response = time.Now()
+		}
 		m, err := c.readMessage()
 		if err != nil {
 			if err == io.EOF {
 				log.Println("[WARNING] Connection closed.")
 			} else {
+				if c.IsServerConn() {
+					if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+						// Handle timeout connection
+						if !mux.pool.Prune(c, true) {
+							// Keep one connection alive
+							// Maybe send a ping?
+							continue
+						}
+						c.Close()
+						log.Println("[WARNING] "+ err.Error())
+						return
+					}
+				}
 				log.Println("[ERROR] "+ err.Error())
 			}
 			return
 		}
 		if m != nil {
+			if c.IsClientConn() {
+				delta := time.Now().Sub(c.tl_response) / time.Millisecond
+				if delta > 3 && delta < 100 {
+					go mux.pool.Populate() // Make sure we have maximum bandwidth
+				}
+			}
 			m.process(mux)
 		}
 	}
@@ -425,6 +451,9 @@ func (c *wsConn) sender(mux *Conn) {
 	for {
 		select {
 		case data := <-c.binary:
+			if c.IsServerConn() {
+				c.SetDeadline(time.Now().Add(ConnTimeout))
+			}
 			_, err := c.Write(data)
 			if err != nil {
 				log.Println("[ERROR] "+ err.Error())
@@ -444,7 +473,7 @@ func (c *wsConn) sendByte(data []byte) {
 func wrapConn(ws *websocket.Conn, h *Header) *wsConn {
 	ws.PayloadType = websocket.BinaryFrame // Default to binary frame for stream
 	if h == nil { h = newHeader() } else { h = h.Clone() }
-	c := wsConn{ws, make(chan []byte, 256), make(chan bool), h, ""}
+	c := wsConn{ws, make(chan []byte, 256), make(chan bool), h, "", time.Now()}
 	return &c
 }
 
@@ -493,7 +522,20 @@ func (p *wsPool) Get() (ws *wsConn, err error) {
 				if err != nil {
 					// Fail to connect, give up the reserved place 
 					p.lock.Lock()
-					p.count--
+					if p.count > 0 {
+						p.count--
+					} else {
+						// Avoid a racing condition with Close()
+						// Looks like Close() was called while a new connection
+						// was attempted (it is the only reason why p.count
+						// would be decremented in the mean time).
+						// Now that the connection attempt failed, no conn would
+						// be put into p.list, which means Close() is left
+						// waiting for one.
+						// We are going to push a nil into the p.list instead,
+						// so that Close() may continue iterate.
+						p.list <- nil
+					}
 					p.lock.Unlock()
 				} else {
 					p.Watch(ws)
@@ -527,24 +569,30 @@ func (p *wsPool) Put(ws *wsConn) {
 
 func (p *wsPool) Close() {
 	p.lock.Lock()
-	defer p.lock.Unlock()
-	if p.max == 0 { return } // already closed
-	for i := p.count; i > 0; i-- {
+	if p.max == 0 {
+		// already closed
+		p.lock.Unlock()
+		return
+	}
+	i := p.count
+	p.count = 0
+	p.max = 0
+	p.lock.Unlock()
+	for ; i > 0; i-- {
 		ws := <-p.list
 		if ws != nil && ws.isConnected() {
 			ws.Close()
 		}
 	}
-	p.count = 0
-	p.max = 0
 	close(p.list)
 	close(p.ondisconnect)
 }
 
-func (p *wsPool) Prune(target *wsConn) {
+func (p *wsPool) Prune(target *wsConn, keep_one bool) bool {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	if p.count == 0 { return }
+	if p.count == 0 { return false }
+	if keep_one && p.count == 1 { return false }
 	temp := make([]*wsConn, 0, int(p.max))
 	defer func() {
 		// Put back the conns
@@ -557,19 +605,34 @@ func (p *wsPool) Prune(target *wsConn) {
 		case ws := <-p.list:
 			if ws == target {
 				p.count--
-				return
+				return true
 			} else {
 				temp = append(temp, ws)
 			}
 		default:
 			// Do not block
-			return
+			return false
 		}
 	}
 }
 
 func (p *wsPool) Watch(ws *wsConn) {
 	p.ondisconnect <-ws.ondisconnect
+}
+
+func (p *wsPool) Add(ws *wsConn) {
+	p.lock.Lock()
+	has_free_slot := p.count < p.max
+	if has_free_slot {
+		p.count++
+	}
+	p.lock.Unlock()
+	if has_free_slot {
+		p.Put(ws)
+		p.Watch(ws)
+	} else {
+		ws.Close()
+	}
 }
 
 func (p *wsPool) Wait() {
@@ -598,24 +661,23 @@ func (p *wsPool) Wait() {
 func (p *wsPool) Populate() {
 	if p.dial == nil { return } // Server side can't dial new connection
 
-	for {
-		p.lock.Lock()
-		has_free_slot := p.count < p.max
-		if has_free_slot { p.count++ }
-		p.lock.Unlock()
-		if !has_free_slot { return }
+	// for { }
+	p.lock.Lock()
+	has_free_slot := p.count < p.max
+	if has_free_slot { p.count++ }
+	p.lock.Unlock()
+	if !has_free_slot { return }
 
-		ws, err := p.dial()
-		if err != nil {
-			p.lock.Lock()
-			p.count--
-			p.lock.Unlock()
-			return
-		} else {
-			p.Watch(ws)
-		}
-		p.Put(ws)
+	ws, err := p.dial()
+	if err != nil {
+		p.lock.Lock()
+		p.count--
+		p.lock.Unlock()
+		return
+	} else {
+		p.Watch(ws)
 	}
+	p.Put(ws)
 }
 
 func (p *wsPool) DePopulate() {
@@ -628,9 +690,18 @@ func (p *wsPool) DePopulate() {
 		p.lock.Unlock()
 		if !has_toomuch_slot { return }
 
-		ws, _ := p.Get()
-		ws.Close()
+		ws := <-p.list
+		if ws == nil { return }
+		if ws.isConnected() {
+			ws.Close()
+		}
 	}
+}
+
+func (p *wsPool) IsMultiplex() bool {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	return p.count > 1
 }
 
 // Main connection struct.
@@ -693,10 +764,6 @@ func (c *Conn) OnDisconnect() chan bool {
 }
 
 func (c *Conn) Close() { c.pool.Close() }
-// func (c *Conn) Request() *http.Request { return c.ws.Request() }
-// func (c *Conn) SetDeadline(t time.Time) error { return c.ws.SetDeadline(t) }
-// func (c *Conn) SetReadDeadline(t time.Time) error { return c.ws.SetReadDeadline(t) }
-// func (c *Conn) SetWriteDeadline(t time.Time) error { return c.ws.SetWriteDeadline(t) }
 
 func (c *Conn) sendJSON(data interface{}) error {
 	ws, err := c.pool.Get()
@@ -770,8 +837,6 @@ func (c *Conn) RemoteStream(name string, kwargs interface{}) (pending StreamRece
 		pending = nil
 		return
 	}
-
-	go c.pool.Populate() // Make we have maximum bandwith
 
 	return
 }
@@ -1156,7 +1221,7 @@ func (p *pendingWriter) write(s stream_packet) (done bool) {
 			return true
 		}
 		p.queue.Append(data)
-		p.seq, done = p.getCache(seq)
+		p.seq, done = p.getBuffer(seq)
 
 	} else {
 		p.seq_cache[seq] = data
@@ -1171,7 +1236,7 @@ func (p *pendingWriter) notifyToWrite() {
 	}
 }
 
-func (p *pendingWriter) getCache(seq uint16) (uint16, bool) {
+func (p *pendingWriter) getBuffer(seq uint16) (uint16, bool) {
 	loop:
 		next_seq := seq + 1
 		data := p.seq_cache[next_seq]

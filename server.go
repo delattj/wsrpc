@@ -6,9 +6,9 @@ import (
 )
 
 
-func Handler(s Service) websocket.Handler {
+func Handler(s Service, max uint8) websocket.Handler {
 	srv := newService()
-	srv.maxSocket(255)
+	srv.maxSocket(max)
 	srv.register(s)
 	return websocket.Handler(
 		func (ws *websocket.Conn) {
@@ -23,8 +23,7 @@ func Handler(s Service) websocket.Handler {
 				mux = newConn(srv, nil)
 				mux.init(c.id, c.header)
 			}
-			mux.pool.Put(c)
-			mux.pool.Watch(c)
+			mux.pool.Add(c)
 			if need_init { go mux.serve() }
 			c.serve(mux)
 		},

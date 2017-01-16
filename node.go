@@ -8,8 +8,27 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+type connSafe struct {
+	ch chan *Conn
+}
+
+func (cs *connSafe) get() (c *Conn) {
+	c = <-cs.ch
+	cs.ch <- c
+	return
+}
+func (cs *connSafe) set(c *Conn) {
+	<-cs.ch
+	cs.ch <- c
+}
+func newConnSafe() *connSafe {
+	ch := make(chan *Conn, 1)
+	ch <- nil
+	return &connSafe{ch}
+}
+
 type Node struct {
-	conn *Conn
+	conn *connSafe
 	Url string
 	Origin string
 	srv *service
@@ -22,22 +41,20 @@ func (n *Node) dial() (c *wsConn, err error) {
 	ws, err = websocket.Dial(n.Url, "", n.Origin)
 	if err != nil { return }
 
-	c = wrapConn(ws, n.conn.Header)
+	mux := n.conn.get()
+	c = wrapConn(ws, mux.Header)
 	err = c.validate(n.srv)
 	if err != nil { panic(err) }
-	go c.serve(n.conn)
+	go c.serve(mux)
 	return
 }
 
 func (n *Node) connect() (err error) {
 	var ws *wsConn
 	mux := newConn(n.srv, n.dial)
-	n.conn = mux
+	n.conn.set(mux)
 	ws, err = mux.pool.Get()
-	if err != nil {
-		n.conn = nil
-		return
-	}
+	if err != nil { return }
 	mux.init(ws.id, ws.header)
 	mux.pool.Put(ws)
 
@@ -53,7 +70,7 @@ func (n *Node) WaitConnected() {
 
 func (n *Node) GetConnection() *Conn {
 	n.connected.Wait()
-	return n.conn
+	return n.conn.get()
 }
 
 // Enable reconnection every <elapse> seconds until successful
@@ -69,13 +86,15 @@ func (n *Node) Serve() {
 	for {
 		err := n.connect()
 		if err != nil {
+			n.conn.set(nil)
 			log.Printf("[ERROR] %s\n", err)
 			if n.reconnect == 0 { break }
 			time.Sleep(time.Duration(n.reconnect) *time.Second)
 
 		} else {
-			n.conn.serve()
+			n.conn.get().serve()
 			// Lost connection
+			n.conn.set(nil)
 			if n.reconnect == 0 { break }
 			n.connected.Add(1)
 		}
@@ -83,7 +102,7 @@ func (n *Node) Serve() {
 }
 
 func (n *Node) Close() error {
-	if c := n.conn; c != nil {
+	if c := n.conn.get(); c != nil {
 		c.Close()
 		return nil
 	}
@@ -96,7 +115,7 @@ func NewNode(url string, s Service) *Node {
 		srv.register(s)
 	}
 
-	n := Node{Url: url, Origin: url, srv: srv}
+	n := Node{Url: url, Origin: url, srv: srv, conn: newConnSafe()}
 	n.connected.Add(1)
 	return &n
 }
