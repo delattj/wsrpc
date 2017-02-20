@@ -23,6 +23,7 @@ func (n *Node) Dispatch(cnx *wsrpc.Conn, kwargs *data.Work, reply wsrpc.Nothing)
 }
 
 func (n *Node) OnHandshake(header *wsrpc.Header) error {
+	log.Printf("[###]")
 	return nil
 }
 
@@ -44,6 +45,7 @@ func (n *Node) OnConnect(cnx *wsrpc.Conn) {
 
 	if n.Filename != "" {
 		go GetFile(cnx, n.Filename)
+		// go WrongTypeCall(cnx, n.Filename)
 	}
 
 }
@@ -51,10 +53,27 @@ func (n *Node) OnConnect(cnx *wsrpc.Conn) {
 func (n *Node) OnDisconnect(cnx *wsrpc.Conn) {
 }
 
+func WrongTypeCall(cnx *wsrpc.Conn, filename string) {
+
+	var i int
+	task, err := cnx.RemoteCall("Node.GetFile", filename, &i)
+	if err != nil {
+		log.Printf("[ERROR] %s\n", err)
+		return
+	}
+	err = task.Wait()
+	if err != nil {
+		log.Printf("[ERROR] %s\n", err)
+		return
+	}
+	log.Println("[INFO] No Error???")
+}
+
 func GetFile(cnx *wsrpc.Conn, filename string) {
 
 	log.Println("[INFO] Requesting file:", filename)
 	stream, err := cnx.RemoteStream("Node.GetFile", filename)
+	// stream, err := cnx.RemoteStream("Node.WrongTypeReponse", filename)
 	if err != nil {
 		log.Printf("[ERROR] %s\n", err)
 		return

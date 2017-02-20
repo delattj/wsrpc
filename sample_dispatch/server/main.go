@@ -135,6 +135,16 @@ func (n *Node) GetFile(cnx *wsrpc.Conn, filename string, stream wsrpc.StreamSend
 	return
 }
 
+func (n *Node) WrongTypeReponse(cnx *wsrpc.Conn, filename string, reply *int) (err error) {
+	log.Printf("[INFO] Requested file %s\n", filename)
+
+	*reply = 1
+
+	log.Printf("[INFO] Done\n")
+	
+	return
+}
+
 func (n *Node) OnHandshake(header *wsrpc.Header) error {
 	return nil
 }

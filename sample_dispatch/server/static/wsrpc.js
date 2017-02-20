@@ -63,10 +63,48 @@ var wsrpc = (function()
 		{
 		//// Private
 			var _ws = new WebSocket(server);
+			_ws.binaryType = 'arraybuffer';
 			var _parent = this;
 			var _header = {channel:""};
 			var _connected = false;
-			_ws.binaryType = 'arraybuffer';
+			var _callbacks = new Object();
+
+			var _processBinary = function(data)
+			{
+				var id = new Uint32Array(data, 0, 32);
+				// var seq = new Uint16Array(data, 32, 16); // ignored for now
+				var payload = data.slice(48);
+				if(!id) return;
+				id = id[0];
+				var callback = _callbacks[id];
+				if (payload.byteLength == 0)
+					// closing channel
+					delete _callbacks[id];
+				if(isset(callback))
+					callback(_parent, payload);
+			}
+			var _processText = function(r_object)
+			{
+				if (!_connected) {
+					_ws.onhandshake(r_object);
+					return
+				}
+				var id = r_object['ID'];
+				if(!isset(id)) return;
+				var callback = _callbacks[id];
+				delete _callbacks[id];
+				var error = r_object['SV'] == 'ERR';
+				if(error)
+					_onerror("Remote Exception:\n"+ r_object['KW']);
+				else
+				{ // assume response (SV == 'R')
+					if(isset(callback))
+					{
+						var value = r_object['KW'];
+						if(isset(value)) callback(_parent, value);
+					}
+				}
+			}
 			_ws.onopen = function()
 			{
 				// Send handshake
@@ -103,28 +141,12 @@ var wsrpc = (function()
 			}
 			_ws.onmessage = function (e)
 			{
-				var r_object = JSON.parse(e.data);
-				if (!_connected) {
-					_ws.onhandshake(r_object);
-					return
-				}
-				var id = r_object['ID'];
-				if(!isset(id)) return;
-				var callback = _callbacks[id];
-				delete _callbacks[id];
-				var error = r_object['SV'] == 'ERR';
-				if(error)
-					_onerror("Remote Exception:\n"+ r_object['KW']);
-				else
-				{ // assume response (SV == 'R')
-					if(isset(callback))
-					{
-						var value = r_object['KW'];
-						if(isset(value)) callback(_parent, value);
-					}
+				if(e.data instanceof ArrayBuffer) {
+					_processBinary(e.data);
+  				} else {
+					_processText(JSON.parse(e.data));
 				}
 			};
-			var _callbacks = new Object();
 			var _onerror = function(data)
 			{
 				if(onerror_cb) onerror_cb(_parent, data);
@@ -144,6 +166,11 @@ var wsrpc = (function()
 				else throw new Error('Not connected to server '+server);
 			}
 			this.get_header = function() { return _header; }
+		}
+
+		this.buffer_to_string = function(buf)
+		{
+  			return String.fromCharCode.apply(null, new Uint16Array(buf));
 		}
 	}
 
