@@ -110,7 +110,7 @@ func (t *MyServices) OnDisconnect(cnx *wsrpc.Conn) {
 For binary stream, the reply type must be **wsrpc.StreamSender**
 ```go
 func (t *MyServices) Channel(cnx *wsrpc.Conn, name string, stream wsrpc.StreamSender) (err error) {
-	c := t.Channel.Subscribe(name)
+	c := t.channels.Subscribe(name)
 	for {
 		select {
 		case data := <- c:
