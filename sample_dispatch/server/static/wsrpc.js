@@ -64,45 +64,49 @@ var wsrpc = (function()
 		//// Private
 			var _ws = new WebSocket(server);
 			_ws.binaryType = 'arraybuffer';
-			var _parent = this;
+			var _this = this;
 			var _header = {channel:""};
 			var _connected = false;
 			var _callbacks = new Object();
 
 			var _processBinary = function(data)
 			{
-				var id = new Uint32Array(data, 0, 32);
-				// var seq = new Uint16Array(data, 32, 16); // ignored for now
-				var payload = data.slice(48);
+				if (!_connected)
+					throw new Error("Not connected yet!");
+
+				var dv = new DataView(data);
+				var id = dv.getUint32(0, false);
 				if(!id) return;
-				id = id[0];
-				var callback = _callbacks[id];
+				// var seq = dv.getUint16(4, false); // ignored for now
+				var payload = data.slice(6);
 				if (payload.byteLength == 0)
 					// closing channel
 					delete _callbacks[id];
+				var callback = _callbacks[id];
 				if(isset(callback))
-					callback(_parent, payload);
+					callback(_this, payload);
 			}
 			var _processText = function(r_object)
 			{
 				if (!_connected) {
 					_ws.onhandshake(r_object);
-					return
+					return;
 				}
 				var id = r_object['ID'];
 				if(!isset(id)) return;
 				var callback = _callbacks[id];
 				delete _callbacks[id];
-				var error = r_object['SV'] == 'ERR';
-				if(error)
+				rtype = r_object['SV'];
+				switch(rtype) {
+				case 'ERR':
 					_onerror("Remote Exception:\n"+ r_object['KW']);
-				else
-				{ // assume response (SV == 'R')
-					if(isset(callback))
-					{
+					break;
+				case 'R':
+					if(isset(callback)) {
 						var value = r_object['KW'];
-						if(isset(value)) callback(_parent, value);
+						if(isset(value)) callback(_this, value);
 					}
+					break;
 				}
 			}
 			_ws.onopen = function()
@@ -112,18 +116,16 @@ var wsrpc = (function()
 			}
 			_ws.onclose = function()
 			{
-				if(!_connected)
-				{
-					if(onconnectfail_cb)
-					{
-						onconnectfail_cb(_parent);
+				if(!_connected) {
+					if(onconnectfail_cb) {
+						onconnectfail_cb(_this);
 						return;
 					}
 					else
 						_onerror('Could not connect to server '+server);
 				}
 				_connected = false;
-				if(onclose_cb) onclose_cb(_parent);
+				if(onclose_cb) onclose_cb(_this);
 			}
 			_ws.onerror = function(e)
 			{
@@ -137,7 +139,7 @@ var wsrpc = (function()
 				var error = header.error;
 				if(isset(error)) throw new Error(error);
 				_connected = true;
-				if(onopen_cb) onopen_cb(_parent);
+				if(onopen_cb) onopen_cb(_this);
 			}
 			_ws.onmessage = function (e)
 			{
@@ -149,15 +151,14 @@ var wsrpc = (function()
 			};
 			var _onerror = function(data)
 			{
-				if(onerror_cb) onerror_cb(_parent, data);
+				if(onerror_cb) onerror_cb(_this, data);
 				else throw new Error(data);
 			}
 		//// Public
 			this.close = function() { _ws.close(); }
 			this.remote_call = function (name, kwargs, callback)
 			{
-				if(_connected)
-				{
+				if(_connected) {
 					var id = isset(callback)? generate_id() : 0;
 					if(id) _callbacks[id] = callback;
 					var call_object = {ID:id, SV:name, KW:kwargs};
@@ -170,7 +171,7 @@ var wsrpc = (function()
 
 		this.buffer_to_string = function(buf)
 		{
-  			return String.fromCharCode.apply(null, new Uint16Array(buf));
+  			return String.fromCharCode.apply(null, new Uint8Array(buf));
 		}
 	}
 

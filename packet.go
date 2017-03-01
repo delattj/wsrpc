@@ -1,11 +1,11 @@
 package wsrpc
 
 import (
-	"log"
-	"errors"
-	"encoding/json"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"golang.org/x/net/websocket"
+	"log"
 )
 
 // Stream packet (implement message interface)
@@ -36,23 +36,25 @@ func (s stream_packet) process(c *Conn) {
 	pending := c.pending_request.peek(id)
 
 	if pending == nil {
-		log.Println("[ERROR] "+ ErrUnknownPendingRequest.Error())
+		log.Println("[ERROR] " + ErrUnknownPendingRequest.Error())
 		return
 	}
 
-	if pending.IsDone() { return }
+	if pending.IsDone() {
+		return
+	}
 
 	if pending.write(s) {
 		c.pending_request.pop(id)
 		pending.done()
-		if pending.Error() == ErrUnexpectedStreamPacket {
+		if pending.Error() == ErrUnexpectedStreamPacket { // Panic?Disconnect?
 			c.sendJSON(&response{ID: id, SV: "CANCEL", KW: nil})
 		}
 	}
 }
 
 func newStream(id []byte, seq uint16, data []byte) stream_packet {
-	var s stream_packet = make([]byte, len(data) + 6)
+	var s stream_packet = make([]byte, len(data)+6)
 	copy(s, id[:4])
 	binary.BigEndian.PutUint16(s[4:6], seq)
 	copy(s[6:], data)
@@ -106,7 +108,6 @@ func stream_unmarshal(msg []byte, payloadType byte, v interface{}) error {
 
 var STREAM = websocket.Codec{stream_marshal, stream_unmarshal}
 
-
 func message_marshal(v interface{}) (msg []byte, payloadType byte, err error) {
 
 	switch data := v.(type) {
@@ -143,4 +144,3 @@ func message_unmarshal(msg []byte, payloadType byte, v interface{}) (err error) 
 }
 
 var MESSAGE = websocket.Codec{message_marshal, message_unmarshal}
-

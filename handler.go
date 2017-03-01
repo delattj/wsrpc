@@ -1,15 +1,15 @@
 package wsrpc
 
 import (
+	"encoding/json"
+	"errors"
+	"golang.org/x/net/websocket"
 	"io"
 	"log"
-	"sync"
-	"time"
-	"errors"
 	"reflect"
 	"strings"
-	"encoding/json"
-	"golang.org/x/net/websocket"
+	"sync"
+	"time"
 )
 
 type Header struct {
@@ -44,7 +44,9 @@ func (h *Header) writeTo(ws *websocket.Conn) error {
 	return websocket.JSON.Send(ws, &h.data)
 }
 func (h *Header) readFrom(ws *websocket.Conn) error {
-	if websocket.JSON.Receive(ws, &h.data) != nil { return ErrHandshake }
+	if websocket.JSON.Receive(ws, &h.data) != nil {
+		return ErrHandshake
+	}
 	if h.Has("error") {
 		return errors.New(h.Get("error").(string))
 	}
@@ -74,7 +76,7 @@ func (msg *request) process(c *Conn) {
 	case "R":
 		err := msg.handleResponse(c)
 		if err != nil {
-			log.Println("[ERROR] "+ err.Error())
+			log.Println("[ERROR] " + err.Error())
 		}
 
 	case "CANCEL":
@@ -88,7 +90,7 @@ func (msg *request) process(c *Conn) {
 				go c.sendResponse(msg.ID, nil, err)
 
 			} else {
-				log.Println("[ERROR] "+ err.Error())
+				log.Println("[ERROR] " + err.Error())
 			}
 		}
 	}
@@ -111,10 +113,10 @@ func (resp *request) handleResponse(c *Conn) (err error) {
 		}
 		return
 	}
-	
+
 	r := pending.Reply()
 	if r == nil {
-		pending.setError(ErrUnexpectedJSONPacket)
+		pending.setError(ErrUnexpectedJSONPacket) // Panic?Disconnect?
 		return
 	}
 	err = json.Unmarshal(resp.KW, r)
@@ -139,7 +141,7 @@ func (req *request) handleRequest(c *Conn) (err error) {
 	methodName := req.SV
 	dot := strings.LastIndex(methodName, ".")
 	if dot < 0 {
-		err = errors.New("wsrpc: service/method request ill-formed: "+ methodName)
+		err = errors.New("wsrpc: service/method request ill-formed: " + methodName)
 		return
 	}
 
@@ -151,7 +153,7 @@ func (req *request) handleRequest(c *Conn) (err error) {
 	}
 	mtype := s.method[methodName]
 	if mtype == nil {
-		err = errors.New("wsrpc: can't find method "+ methodName)
+		err = errors.New("wsrpc: can't find method " + methodName)
 		return
 	}
 
@@ -222,7 +224,7 @@ func call(c *Conn, id uint32, mtype *methodType, argv, replyv reflect.Value, str
 		}
 
 	} else if err != nil {
-		log.Println("[ERROR] "+ err.Error())
+		log.Println("[ERROR] " + err.Error())
 	}
 }
 
@@ -240,19 +242,20 @@ type PendingRequest interface {
 	setError(error)
 	write(stream_packet) bool
 }
+
 // Use p.Wait(), p.WaitTimeout(t) or <-p.OnDone() to know when the reply value is ready.
 // p.Wait() and p.WaitTimeout(t) return remote error or wsrpc.ErrTimeout.
 // Reply value and Error message are retrivable respectively through p.Reply() and p.Error()
 // You should access those fields only when p.OnDone() is released.
 
 type pendingRequest struct {
-	reply interface{}
+	reply  interface{}
 	ondone chan bool
-	error error
+	error  error
 }
 
 func newPendingRequest(reply interface{}) PendingRequest {
-	return &pendingRequest{reply:reply, ondone:make(chan bool)}
+	return &pendingRequest{reply: reply, ondone: make(chan bool)}
 }
 
 func (p *pendingRequest) done() {
@@ -260,7 +263,7 @@ func (p *pendingRequest) done() {
 }
 
 func (p *pendingRequest) write(s stream_packet) bool {
-	p.error = ErrUnexpectedStreamPacket
+	p.error = ErrUnexpectedStreamPacket // Panic?Disconnect?
 	return true
 }
 
@@ -290,7 +293,7 @@ func (p *pendingRequest) Wait() error {
 func (p *pendingRequest) WaitTimeout(t time.Duration) error {
 	ticker := time.NewTicker(t)
 	defer ticker.Stop()
-	
+
 	select {
 	case <-p.ondone:
 		return p.error
@@ -311,7 +314,6 @@ func (p *pendingRequest) IsDone() bool {
 
 func (p *pendingRequest) HasFailed() bool { return p.error != nil }
 
-
 // Stream sender
 
 type StreamSender interface {
@@ -330,25 +332,25 @@ type StreamSender interface {
 }
 
 type streamer struct {
-	c *Conn
-	id uint32
-	id_b []byte
-	seq uint16
+	c            *Conn
+	id           uint32
+	id_b         []byte
+	seq          uint16
 	packet_total uint64
-	packet_sent uint64
-	ondone chan bool
-	error error
-	progress sync.RWMutex
+	packet_sent  uint64
+	ondone       chan bool
+	error        error
+	progress     sync.RWMutex
 }
 
 func newStreamer(id uint32, c *Conn) StreamSender {
-	return &streamer{c:c, id:id, id_b:toStreamId(id), ondone:make(chan bool)}
+	return &streamer{c: c, id: id, id_b: toStreamId(id), ondone: make(chan bool)}
 }
 
 // Calculate number of chunk
 func PacketRequire(length uint64) uint64 {
 	n := length / MaxChunkSize
-	if length % MaxChunkSize > 0 {
+	if length%MaxChunkSize > 0 {
 		n++
 	}
 	return n
@@ -382,15 +384,21 @@ func (s *streamer) End() {
 	seq := s.seq
 	s.progress.Unlock()
 
-	if s.sendPacket(endOfStream(s.id_b, seq)) == nil { s.done() }
+	if s.sendPacket(endOfStream(s.id_b, seq)) == nil {
+		s.done()
+	}
 }
 
-func(s *streamer) sendPacket(packet stream_packet) error {
-	if s.IsDone() { return s.error }
+func (s *streamer) sendPacket(packet stream_packet) error {
+	if s.IsDone() {
+		return s.error
+	}
 	// return s.c.sendByte(packet) // One Connection
 	// Multiple Connections
 	ws, err := s.c.pool.Get()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	ws.sendByte(packet)
 	return nil
 }
@@ -412,7 +420,9 @@ func (s *streamer) SendFile(r io.Reader, length uint64) (err error) {
 	b := make([]byte, MaxChunkSize)
 	// Payload first
 	err = s.sendPacket(newPayload(id_b, length))
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	// Loop through all chunks
 	var i uint64
 	var seq uint16 = 1
@@ -429,7 +439,9 @@ func (s *streamer) SendFile(r io.Reader, length uint64) (err error) {
 		}
 
 		err = s.sendPacket(newStream(id_b, seq, b[:nr]))
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 
 		length -= uint64(nr)
 		s.progress.Lock()
@@ -440,7 +452,9 @@ func (s *streamer) SendFile(r io.Reader, length uint64) (err error) {
 	// Send end of feed
 	seq++
 	err = s.sendPacket(endOfStream(id_b, seq))
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	s.done()
 
@@ -460,7 +474,7 @@ func (s *streamer) setError(err error) {
 	s.done()
 }
 
-func (s * streamer) Progress() (uint64, uint64) {
+func (s *streamer) Progress() (uint64, uint64) {
 	s.progress.RLock()
 	defer s.progress.RUnlock()
 	return s.packet_sent, s.packet_total
@@ -489,7 +503,7 @@ func (s *streamer) Wait() error {
 func (s *streamer) WaitTimeout(t time.Duration) error {
 	ticker := time.NewTicker(t)
 	defer ticker.Stop()
-	
+
 	select {
 	case <-s.ondone:
 		return s.error
@@ -568,9 +582,13 @@ func (l *byteList) Extend(list *byteList) {
 
 func (l *byteList) Pop() []byte {
 	first_p := l.head
-	if first_p == nil { return nil }
+	if first_p == nil {
+		return nil
+	}
 	l.head = first_p.next
-	if l.head == nil { l.tail = nil }
+	if l.head == nil {
+		l.tail = nil
+	}
 	return first_p.data
 }
 
@@ -580,9 +598,9 @@ func (l *byteList) IsEmpty() bool {
 
 type sequence struct {
 	first uint16
-	last uint16
-	list *byteList
-	next *sequence
+	last  uint16
+	list  *byteList
+	next  *sequence
 }
 
 func newSequence(seq uint16, data []byte) *sequence {
@@ -608,7 +626,9 @@ func insertInSequence(d *sequence, seq uint16, data []byte, cursor uint16) (top 
 		}
 		if next != nil && d.last > cursor {
 			// seq is right between d.last and next.first
-			if next.first < cursor && seq < next.first { goto insert }
+			if next.first < cursor && seq < next.first {
+				goto insert
+			}
 			// If not, we can skip the sequence and start searching
 			d = next
 			next = d.next
@@ -626,55 +646,57 @@ func insertInSequence(d *sequence, seq uint16, data []byte, cursor uint16) (top 
 	}
 	// Search the sequences between which seq will be inserted
 	for next != nil {
-		if seq > d.last && (seq < next.first || (next.first < cursor && seq > cursor)) { break }
+		if seq > d.last && (seq < next.first || (next.first < cursor && seq > cursor)) {
+			break
+		}
 		d = next
 		next = d.next
 	}
-	insert:
-		if d.last == n {
-			d.list.Append(data)
-			if next != nil && next.first == e {
-				// We extend the list in which we already append data,
-				// Let's merge it to form a continuous sequence.
-				d.list.Extend(next.list)
-				d.next = next.next
-				d.last = next.last
-			} else {
-				d.last = seq
-			}
-			return
-		}
+insert:
+	if d.last == n {
+		d.list.Append(data)
 		if next != nil && next.first == e {
-			next.list.Prepend(data)
-			next.first = seq
-			return
+			// We extend the list in which we already append data,
+			// Let's merge it to form a continuous sequence.
+			d.list.Extend(next.list)
+			d.next = next.next
+			d.last = next.last
+		} else {
+			d.last = seq
 		}
-		// no prepend, no append occured,
-		// we insert a new sequence
-		// d.last < seq < next.first
-		d.next = newSequence(seq, data)
-		d.next.next = next
 		return
+	}
+	if next != nil && next.first == e {
+		next.list.Prepend(data)
+		next.first = seq
+		return
+	}
+	// no prepend, no append occured,
+	// we insert a new sequence
+	// d.last < seq < next.first
+	d.next = newSequence(seq, data)
+	d.next.next = next
+	return
 }
 
 type pendingWriter struct {
 	pendingRequest
-	id uint32
-	c *Conn
-	queue *byteList
-	towrite chan bool
-	seq_cache *sequence
-	seq uint16
-	writing sync.Mutex
-	progress sync.RWMutex
+	id           uint32
+	c            *Conn
+	queue        *byteList
+	towrite      chan bool
+	seq_cache    *sequence
+	seq          uint16
+	writing      sync.Mutex
+	progress     sync.RWMutex
 	packet_total uint64
-	packet_sent uint64
+	packet_sent  uint64
 }
 
 func newPendingWriter(id uint32, c *Conn) StreamReceiver {
 	return &pendingWriter{
-		pendingRequest:pendingRequest{ondone:make(chan bool)},
-		id:id, c:c, towrite:make(chan bool, 1), queue:new(byteList),
+		pendingRequest: pendingRequest{ondone: make(chan bool)},
+		id:             id, c: c, towrite: make(chan bool, 1), queue: new(byteList),
 	}
 }
 
@@ -703,14 +725,14 @@ func (p *pendingWriter) write(s stream_packet) (end_of_feed bool) {
 
 func (p *pendingWriter) notifyToWrite() {
 	select { // Notify data is ready
-	case p.towrite <-true:
-	default :
+	case p.towrite <- true:
+	default:
 	}
 }
 
 func (p *pendingWriter) getBuffer(seq uint16) (uint16, bool) {
 	seq_cache := p.seq_cache
-	if seq_cache != nil && seq_cache.first == (seq + 1) {
+	if seq_cache != nil && seq_cache.first == (seq+1) {
 		p.queue.Extend(seq_cache.list)
 		p.seq_cache = seq_cache.next
 		// Empty data means end of feed
@@ -737,7 +759,9 @@ func (p *pendingWriter) Receive() ([]byte, error) {
 	if <-p.towrite || !p.queue.IsEmpty() {
 		p.writing.Lock()
 		data = p.queue.Pop()
-		if !p.queue.IsEmpty() && !p.IsDone() { p.notifyToWrite() }
+		if !p.queue.IsEmpty() && !p.IsDone() {
+			p.notifyToWrite()
+		}
 		p.writing.Unlock()
 	}
 	return data, p.error
@@ -746,7 +770,9 @@ func (p *pendingWriter) Receive() ([]byte, error) {
 func (p *pendingWriter) ReceiveFile(dst io.Writer) error {
 	// Very first packet is payload
 	data, err := p.Receive()
-	if data == nil { return err }
+	if data == nil {
+		return err
+	}
 	if len(data) != 8 {
 		err = errors.New("wsrpc: Wrong bytes size for payload.")
 		p.setError(err)
@@ -797,5 +823,3 @@ func (p *pendingWriter) Cancel() error {
 
 	return p.c.sendJSON(&r)
 }
-
-

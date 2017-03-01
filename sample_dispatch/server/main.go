@@ -1,27 +1,27 @@
 package main
 
 import (
-	"os"
-	"log"
-	"sync"
-	"flag"
-	"net/http"
-	"html/template"
 	"../../../wsrpc"
 	"../data"
+	"flag"
+	"html/template"
+	"log"
+	"net/http"
+	"os"
+	"sync"
+	"time"
 )
 
 var (
 	Nodes *NodesManager
 )
 
-
 type Page struct {
 	Server string
 }
 
 func renderTemplate(w http.ResponseWriter, tmpl string, p *Page) {
-	t, _ := template.ParseFiles("templates/"+ tmpl)
+	t, _ := template.ParseFiles("templates/" + tmpl)
 	t.Execute(w, p)
 }
 
@@ -30,7 +30,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	renderTemplate(w, "base.html", p)
 }
 
-type Web struct {}
+type Web struct{}
 
 func (w *Web) Dispatch(cnx *wsrpc.Conn, kwargs, reply *data.Work) (err error) {
 	log.Printf("[INFO] From Web, dispatch: %s\n", kwargs.Name)
@@ -38,6 +38,20 @@ func (w *Web) Dispatch(cnx *wsrpc.Conn, kwargs, reply *data.Work) (err error) {
 	go Nodes.DispatchAll(kwargs)
 
 	*reply = *kwargs
+	return
+}
+
+func (w *Web) StreamToMe(cnx *wsrpc.Conn, data string, stream wsrpc.StreamSender) (err error) {
+	log.Printf("[INFO] Stream requested: %s\n", data)
+
+	for {
+		time.Sleep(15 * time.Second)
+		err = stream.Send([]byte(data))
+		if err != nil {
+			return
+		}
+	}
+
 	return
 }
 
@@ -54,7 +68,7 @@ func (w *Web) OnDisconnect(cnx *wsrpc.Conn) {
 
 type NodesManager struct {
 	nodes map[string]*wsrpc.Conn
-	sync sync.Mutex
+	sync  sync.Mutex
 }
 
 func NewNodesManager() *NodesManager {
@@ -103,7 +117,7 @@ func (m *NodesManager) DispatchAll(w *data.Work) {
 	}
 }
 
-type Node struct {}
+type Node struct{}
 
 func (n *Node) RegisterMac(cnx *wsrpc.Conn, mac string, reply *int) (err error) {
 	log.Printf("[INFO] Registering %s\n", mac)
@@ -118,9 +132,13 @@ func (n *Node) GetFile(cnx *wsrpc.Conn, filename string, stream wsrpc.StreamSend
 	log.Printf("[INFO] Requested file %s\n", filename)
 
 	file, err := os.Open(filename)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	info, err := file.Stat()
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	err = stream.SendFile(file, uint64(info.Size()))
 	if err != nil {
@@ -131,7 +149,7 @@ func (n *Node) GetFile(cnx *wsrpc.Conn, filename string, stream wsrpc.StreamSend
 	file.Close()
 
 	log.Printf("[INFO] Done\n")
-	
+
 	return
 }
 
@@ -141,7 +159,7 @@ func (n *Node) WrongTypeReponse(cnx *wsrpc.Conn, filename string, reply *int) (e
 	*reply = 1
 
 	log.Printf("[INFO] Done\n")
-	
+
 	return
 }
 
@@ -162,7 +180,6 @@ func (n *Node) OnDisconnect(cnx *wsrpc.Conn) {
 	}
 }
 
-
 func main() {
 
 	// Command line arguments
@@ -174,7 +191,7 @@ func main() {
 
 	// Register wsrpc services on the http server
 	http.Handle("/node", wsrpc.Handler(new(Node), 6)) // ws://<host>:<port>/node
-	http.Handle("/web", wsrpc.Handler(new(Web), 6)) // ws://<host>:<port>/web
+	http.Handle("/web", wsrpc.Handler(new(Web), 1))   // ws://<host>:<port>/web
 
 	// static files
 	http.Handle("/static/",
@@ -183,9 +200,9 @@ func main() {
 	// index
 	http.HandleFunc("/", indexHandler)
 
-	log.Println("[INFO] Serving through:", "localhost:"+ port)
+	log.Println("[INFO] Serving through:", "localhost:"+port)
 
-	err := http.ListenAndServe(":"+ port, nil)
+	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Println("[ERROR] (Server) " + err.Error())
 	}

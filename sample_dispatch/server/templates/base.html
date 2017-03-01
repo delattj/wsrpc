@@ -3,31 +3,68 @@
 	<head>
 		<title>Dispatch example</title>
 		<script src="/static/wsrpc.js" language="javascript"></script>
+		<script src="/static/vue.min.js" language="javascript"></script>
 	</head>
+	<style>
+	.column {
+		display: inline-block;
+		vertical-align: top;
+		margin: 10px;
+	}
+	</style>
 	<script>
 
 var server = null;
+var log = null;
+var stream = null;
 
 function init_page(address)
 {
-	server = new wsrpc.Node(address);
+	log = new Vue({
+		el: '#log',
+		data: {
+			lines: []
+		}
+	});
+	stream = new Vue({
+		el: '#stream',
+		data: {
+			lines: []
+		}
+	});
+	server = new wsrpc.Node(
+		address,
+		function(node) {
+			node.remote_call('Web.StreamToMe', '>>> streaming', add_to_stream)
+		}
+	);
 }
 
-function log(node, data)
+function add_to_log(node, data)
 {
-	var l = document.getElementById('log');
-	var html_c = '<div>Dispatched '+ data.Name +'</div>';
-	l.insertAdjacentHTML('beforeend', html_c);
+	log.lines.push({text: 'Dispatched '+ data.Name})
+}
+
+function add_to_stream(node, data)
+{
+	stream.lines.push({text: wsrpc.buffer_to_string(data)})
 }
 
 	</script>
 
 <body onload="init_page('ws://{{ .Server }}/web')">
 	<div>
-		<button onclick="server.remote_call('Web.Dispatch', {Name:'Some work'}, log);">Dispatch Work</button>
+		<button onclick="server.remote_call('Web.Dispatch', {Name:'Some work'}, add_to_log);">Dispatch Work</button>
 		<button onclick="server.close();">Close</button>
 	</div>
-	<div id="log"></div>
+	<div>
+		<div id="log" class="column">
+			<div v-for="line in lines">{{"{{ line.text }}"}}</div>
+		</div>
+		<div id="stream" class="column">
+			<div v-for="line in lines">{{"{{ line.text }}"}}</div>
+		</div>
+	</div>
 </body>
 
 </html>
