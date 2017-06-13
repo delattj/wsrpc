@@ -104,7 +104,7 @@ func (resp *request) handleResponse(c *Conn) (err error) {
 
 	// Decode Response content(KW) depending of the SV type (error or reply data)
 	if resp.SV == "ERR" {
-		var errMsg string
+		var errMsg string // {etype: String, message: String, code: Int} ?
 		err = json.Unmarshal(resp.KW, &errMsg)
 		if err == nil {
 			pending.setError(errors.New(errMsg))
@@ -116,7 +116,8 @@ func (resp *request) handleResponse(c *Conn) (err error) {
 
 	r := pending.Reply()
 	if r == nil {
-		pending.setError(ErrUnexpectedJSONPacket) // Panic?Disconnect?
+		pending.setError(ErrUnexpectedJSONPacket)
+		c.Close()
 		return
 	}
 	err = json.Unmarshal(resp.KW, r)

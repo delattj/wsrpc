@@ -47,8 +47,9 @@ func (s stream_packet) process(c *Conn) {
 	if pending.write(s) {
 		c.pending_request.pop(id)
 		pending.done()
-		if pending.Error() == ErrUnexpectedStreamPacket { // Panic?Disconnect?
-			c.sendJSON(&response{ID: id, SV: "CANCEL", KW: nil})
+		if pending.Error() == ErrUnexpectedStreamPacket {
+			c.Close()
+			// c.sendJSON(&response{ID: id, SV: "CANCEL", KW: nil})
 		}
 	}
 }

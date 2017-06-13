@@ -1,19 +1,19 @@
 package main
 
 import (
-	"os"
-	"net"
-	"log"
-	"time"
-	"flag"
-	"syscall"
-	"os/signal"
-	"../../../wsrpc"
 	"../data"
+	"flag"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+	"wsrpc"
 )
 
 type Node struct {
-	Mac string
+	Mac      string
 	Filename string
 }
 
@@ -87,9 +87,9 @@ func GetFile(cnx *wsrpc.Conn, filename string) {
 	}
 
 	go func() {
-		ticker := time.NewTicker(1*time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		
+
 		var l, p uint64
 		for l == 0 || l != p {
 			select {
@@ -99,7 +99,7 @@ func GetFile(cnx *wsrpc.Conn, filename string) {
 			case <-ticker.C:
 				p, l = stream.Progress()
 				if l > 0 {
-					pp := p*100 / l
+					pp := p * 100 / l
 					log.Printf("[PROGRESS] %v%%\n", pp)
 				}
 			}
@@ -150,12 +150,12 @@ func main() {
 	n.Mac = mac
 	n.Filename = filename
 
-	ws := wsrpc.NewNode("ws://"+ server +"/node", n)
+	ws := wsrpc.NewNode("ws://"+server+"/node", n)
 	ws.SetMaxSocket(uint8(max_socket))
 	ws.SetReconnect(5) // If disconnected, try reconnecting every 5 seconds
 
 	// Trap Keyboard interrupt and start service
-	OnInterrupt(func() {ws.Close()})
+	OnInterrupt(func() { ws.Close() })
 	ws.Serve()
 
 }

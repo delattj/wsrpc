@@ -1,7 +1,6 @@
 package main
 
 import (
-	"../../../wsrpc"
 	"../data"
 	"flag"
 	"html/template"
@@ -10,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"wsrpc"
 )
 
 var (

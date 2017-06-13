@@ -24,13 +24,15 @@ function init_page(address)
 		el: '#log',
 		data: {
 			lines: []
-		}
+		},
+		delimiters: ["[[", "]]"]
 	});
 	stream = new Vue({
 		el: '#stream',
 		data: {
 			lines: []
-		}
+		},
+		delimiters: ["[[", "]]"]
 	});
 	server = new wsrpc.Node(
 		address,
@@ -59,10 +61,10 @@ function add_to_stream(node, data)
 	</div>
 	<div>
 		<div id="log" class="column">
-			<div v-for="line in lines">{{"{{ line.text }}"}}</div>
+			<div v-for="line in lines">[[ line.text ]]</div>
 		</div>
 		<div id="stream" class="column">
-			<div v-for="line in lines">{{"{{ line.text }}"}}</div>
+			<div v-for="line in lines">[[ line.text ]]</div>
 		</div>
 	</div>
 </body>
